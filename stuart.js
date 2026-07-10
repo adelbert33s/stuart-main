@@ -77,7 +77,6 @@
   const discordUploadToggle = $("discord-upload-toggle");
   const discordThreadPrefix = $("discord-thread-prefix");
   const discordForumChannelId = $("discord-forum-channel-id");
-  const discordPollInterval = $("discord-poll-interval");
   const discordWebhookUrl   = $("discord-webhook-url");
   const discordBotToken     = $("discord-bot-token");
   const discordWebhookShowBtn = $("discord-webhook-show-btn");
@@ -1640,9 +1639,7 @@
     if (!discordPollStatusEl) return;
     const st = s?.discord_poll_status || s;
     if (!st || !st.lastAt) {
-      discordPollStatusEl.textContent = s?.discord_poll_ready
-        ? "Poller ready — waiting for first cycle"
-        : "Set bot token + forum channel id to enable import polling";
+      discordPollStatusEl.textContent = "Each agent upload imports only that zip. Use Poll Discord only for missed recovery.";
       return;
     }
     const when = new Date(st.lastAt).toLocaleTimeString();
@@ -1662,7 +1659,6 @@
       if (discordForumChannelId && !discordForumChannelId.dataset.dirty) {
         discordForumChannelId.value = s.discord_forum_channel_id || "";
       }
-      if (discordPollInterval) discordPollInterval.value = s.discord_poll_interval_sec || 15;
       if (discordWebhookUrl && s.discord_webhook_url !== undefined && !discordWebhookUrl.dataset.dirty) {
         discordWebhookUrl.value = s.discord_webhook_url || "";
       }
@@ -1687,7 +1683,6 @@
           discord_upload_enabled: discordUploadToggle?.checked ?? false,
           discord_thread_prefix: discordThreadPrefix?.value?.trim() || "Stuart",
           discord_forum_channel_id: discordForumChannelId?.value?.trim() || "",
-          discord_poll_interval_sec: Number(discordPollInterval?.value) || 15,
           ...(extra || {}),
         };
         await rpc("update_capture_settings", body);
@@ -1710,7 +1705,6 @@
         discord_upload_enabled: discordUploadToggle?.checked ?? false,
         discord_thread_prefix: discordThreadPrefix?.value?.trim() || "Stuart",
         discord_forum_channel_id: discordForumChannelId?.value?.trim() || "",
-        discord_poll_interval_sec: Number(discordPollInterval?.value) || 15,
       };
       if (url && !url.includes("…") && !url.includes("****")) body.discord_webhook_url = url;
       else if (!url) body.discord_webhook_url = "";
@@ -1817,7 +1811,6 @@
       if (discordUploadToggle) discordUploadToggle.disabled = true;
       if (discordThreadPrefix) discordThreadPrefix.disabled = true;
       if (discordForumChannelId) discordForumChannelId.disabled = true;
-      if (discordPollInterval) discordPollInterval.disabled = true;
       if (discordWebhookUrl) discordWebhookUrl.disabled = true;
       if (discordBotToken) discordBotToken.disabled = true;
       if (discordWebhookShowBtn) discordWebhookShowBtn.disabled = true;
@@ -1840,7 +1833,6 @@
     if (cookieAgeInput) cookieAgeInput.addEventListener("change", saveCaptureSettings);
     if (discordUploadToggle) discordUploadToggle.addEventListener("change", () => saveCaptureSettings());
     if (discordThreadPrefix) discordThreadPrefix.addEventListener("change", () => saveCaptureSettings());
-    if (discordPollInterval) discordPollInterval.addEventListener("change", () => saveCaptureSettings());
     if (discordForumChannelId) {
       discordForumChannelId.addEventListener("input", () => { discordForumChannelId.dataset.dirty = "1"; });
       discordForumChannelId.addEventListener("change", () => saveCaptureSettings());
