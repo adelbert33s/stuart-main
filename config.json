@@ -1,0 +1,9 @@
+{
+  "name": "Stuart",
+  "version": "1.0.0",
+  "description": "Browser credential recovery — global harvest view",
+  "navbar": {
+    "label": "Stuart",
+    "icon": "fa-skull"
+  }
+}

@@ -1,0 +1,36 @@
+# Packaged plugin output
+*.zip
+server.js
+
+# Dependencies (installed at build time)
+node_modules/
+bun.lockb
+
+# CGo-generated header (rebuilt on each compile)
+*-windows-amd64.h
+*-linux-amd64.h
+*-darwin-amd64.h
+
+# Native plugin binaries (built by build.sh / build.bat)
+*-windows-amd64.dll
+*-linux-amd64.so
+*-darwin-amd64.dylib
+*-darwin-arm64.dylib
+recovery-key-extractor.dll
+native/recovery/platform/recovery-key-extractor.dll
+
+# Go build artifacts
+bin/
+*.exe
+*.test
+*.out
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
