@@ -1779,17 +1779,27 @@
   }
 
   async function pollDiscordNow() {
-    log("Polling Discord forum for log zips…");
+    log("Polling Discord forum for Stuart harvest posts…");
     if (discordPollBtn) discordPollBtn.disabled = true;
     if (discordPollNowBtn) discordPollNowBtn.disabled = true;
     try {
       const r = await rpc("poll_discord", {});
       if (r.skipped) {
         log(`Discord poll skipped: ${r.reason || "n/a"}`);
-      } else if (!r.ok) {
-        log(`Discord poll failed: ${r.error || "unknown"}`);
+      } else if (r.ok === false && r.error) {
+        log(`Discord poll failed: ${r.error}`);
       } else {
-        log(`Discord poll: threads=${r.threads} imported=${r.imported}${(r.errors && r.errors.length) ? " errors=" + r.errors.length : ""}`);
+        log(
+          `Discord poll: threads=${r.threads ?? 0} imported=${r.imported ?? 0} ` +
+          `skipped=${r.skippedInvalid ?? 0}` +
+          ((r.errors && r.errors.length) ? ` errors=${r.errors.length}` : "")
+        );
+        if (r.details?.length) {
+          for (const d of r.details.slice(0, 8)) log(`  · ${d}`);
+        }
+        if (r.errors?.length) {
+          for (const e of r.errors.slice(0, 5)) log(`  ! ${e}`);
+        }
         if (isGlobal) await loadGlobalStats().then(() => loadGlobalTab());
       }
       const s = await rpc("get_discord_poll_status");

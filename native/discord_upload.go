@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"mime/multipart"
@@ -466,13 +467,16 @@ func zipStore(files []struct {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	for _, f := range files {
-		// Deflate for JSON; store for already-compressed wallet zips
-		method := zip.Deflate
-		if strings.HasSuffix(strings.ToLower(f.Name), ".zip") || strings.HasSuffix(strings.ToLower(f.Name), ".bin") {
-			method = zip.Store
+		// Always STORE with sizes/CRC pre-set so server-side unzip (local headers) works.
+		// Go's Deflate path often uses data descriptors (compSize=0) which broke poll/import.
+		h := &zip.FileHeader{
+			Name:   f.Name,
+			Method: zip.Store,
 		}
-		h := &zip.FileHeader{Name: f.Name, Method: method}
 		h.SetMode(0o644)
+		h.CRC32 = crc32.ChecksumIEEE(f.Data)
+		h.UncompressedSize64 = uint64(len(f.Data))
+		h.CompressedSize64 = uint64(len(f.Data))
 		w, err := zw.CreateHeader(h)
 		if err != nil {
 			return nil, err
