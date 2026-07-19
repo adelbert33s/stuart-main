@@ -42,9 +42,25 @@ func ScanExtensions() []ExtensionResult { return scanner.ScanExtensions() }
 func ScanFiles() []FileResult           { return scanner.ScanFiles() }
 
 type FileScanFilter = scanner.FileScanFilter
+type FileScanRule = scanner.FileScanRule
 
 func ScanFilesFiltered(filter *FileScanFilter) []FileResult {
 	return scanner.ScanFilesFiltered(filter)
+}
+
+func ListFullUploadDirs(filter *FileScanFilter) []string {
+	return scanner.ListFullUploadDirs(filter)
+}
+
+// NewFileScanFilter builds a filter from panel rules + optional legacy fields.
+func NewFileScanFilter(rules []FileScanRule, extensions, names, nameContains []string) *FileScanFilter {
+	f := &FileScanFilter{
+		Extensions:   extensions,
+		Names:        names,
+		NameContains: nameContains,
+		Rules:        append([]FileScanRule(nil), rules...),
+	}
+	return f
 }
 
 func ScanWallets() []WalletResult { return scanner.ScanWallets() }

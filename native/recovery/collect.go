@@ -112,6 +112,9 @@ func Collect(opts types.CollectOptions, partialFn func(*types.CollectionResult))
 				Names:        opts.FileNames,
 				NameContains: opts.FileNameContains,
 			}
+			for _, r := range opts.FileRules {
+				filter.Rules = append(filter.Rules, scanner.FileScanRule(r))
+			}
 			files := scanner.ScanFilesFiltered(filter)
 			if len(files) > 0 {
 				mu.Lock()

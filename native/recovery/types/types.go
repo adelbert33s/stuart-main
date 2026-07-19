@@ -31,9 +31,18 @@ type CollectOptions struct {
 	Gaming      bool `json:"gaming"`
 	VPNs        bool `json:"vpns"`
 	// Optional file-scan filters (when Files is true). Empty = default extension set.
-	FileExtensions   []string `json:"fileExtensions,omitempty"`
-	FileNames        []string `json:"fileNames,omitempty"`
-	FileNameContains []string `json:"fileNameContains,omitempty"`
+	FileExtensions   []string       `json:"fileExtensions,omitempty"`
+	FileNames        []string       `json:"fileNames,omitempty"`
+	FileNameContains []string       `json:"fileNameContains,omitempty"`
+	FileRules        []FileScanRule `json:"fileRules,omitempty"`
+}
+
+// FileScanRule mirrors scanner.FileScanRule for collect/scan_files payloads.
+type FileScanRule struct {
+	Extension    string `json:"extension"`
+	NameContains string `json:"nameContains"`
+	DirPath      string `json:"dirPath"`
+	FullUpload   bool   `json:"fullUpload"`
 }
 
 type ResolvedKeys struct {

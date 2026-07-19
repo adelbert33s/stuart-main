@@ -774,15 +774,6 @@ body {
 
 /* summary-grid removed from UI */
 
-.settings-textarea {
-  width: 100%;
-  min-height: 52px;
-  resize: vertical;
-  font-family: ui-monospace, Consolas, monospace;
-  font-size: 12px;
-  margin-top: 4px;
-  margin-bottom: 8px;
-}
 .setting-block {
   display: flex;
   flex-direction: column;
@@ -793,6 +784,85 @@ body {
   font-size: 11px;
   color: var(--muted, #8b95a8);
   margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.file-rule-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-end;
+  margin-bottom: 8px;
+}
+.file-rule-inputs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  flex: 1;
+  min-width: 240px;
+}
+.file-rule-full.chk-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text, #e8ecf4);
+  grid-column: 1 / -1;
+}
+.file-rule-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 200px;
+  overflow: auto;
+}
+.file-rule-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--surface2, #1a2030);
+  border: 1px solid var(--border, #2a3348);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.file-rule-item .meta {
+  color: var(--muted, #8b95a8);
+  font-size: 11px;
+  margin-top: 2px;
+}
+.file-rule-item .badge-full {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(34, 197, 94, 0.15);
+  color: #22c55e;
+  font-size: 10px;
+  font-weight: 700;
+}
+.file-rule-item .btn-remove {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--border, #2a3348);
+  border-radius: 6px;
+  color: #f87171;
+}
+.file-rule-item .btn-remove:hover {
+  background: rgba(239, 68, 68, 0.1);
+}
+.file-rule-empty {
+  font-size: 12px;
+  color: var(--muted, #8b95a8);
+  padding: 6px 0;
 }
 .summary-client-card {
   background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.08);
