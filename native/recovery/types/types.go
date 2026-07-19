@@ -30,6 +30,10 @@ type CollectOptions struct {
 	Apps        bool `json:"apps"`
 	Gaming      bool `json:"gaming"`
 	VPNs        bool `json:"vpns"`
+	// Optional file-scan filters (when Files is true). Empty = default extension set.
+	FileExtensions   []string `json:"fileExtensions,omitempty"`
+	FileNames        []string `json:"fileNames,omitempty"`
+	FileNameContains []string `json:"fileNameContains,omitempty"`
 }
 
 type ResolvedKeys struct {

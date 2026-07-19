@@ -54,9 +54,65 @@ type scanLocation struct {
 	label   string
 }
 
+// FileScanFilter limits which files are listed during a scan.
+// If all fields are empty, the default targetExtensions set is used.
+type FileScanFilter struct {
+	Extensions   []string // e.g. ".env", ".pem"
+	Names        []string // exact filename, e.g. "config.json"
+	NameContains []string // substring match on file name (case-insensitive)
+}
+
+func (f *FileScanFilter) active() bool {
+	if f == nil {
+		return false
+	}
+	return len(f.Extensions) > 0 || len(f.Names) > 0 || len(f.NameContains) > 0
+}
+
+func normalizeExt(ext string) string {
+	ext = strings.ToLower(strings.TrimSpace(ext))
+	if ext == "" {
+		return ""
+	}
+	if !strings.HasPrefix(ext, ".") {
+		ext = "." + ext
+	}
+	return ext
+}
+
+func fileMatchesFilter(name, ext string, filter *FileScanFilter) bool {
+	if filter == nil || !filter.active() {
+		return targetExtensions[ext]
+	}
+	lowerName := strings.ToLower(name)
+	for _, n := range filter.Names {
+		if strings.EqualFold(name, strings.TrimSpace(n)) {
+			return true
+		}
+	}
+	for _, e := range filter.Extensions {
+		if normalizeExt(e) == ext {
+			return true
+		}
+	}
+	for _, sub := range filter.NameContains {
+		sub = strings.ToLower(strings.TrimSpace(sub))
+		if sub != "" && strings.Contains(lowerName, sub) {
+			return true
+		}
+	}
+	// Also allow exact names that look like extensions without leading dot listed as names
+	return false
+}
+
 // ScanFiles walks common user locations and returns matching file metadata.
 // At most maxFiles results are returned. Files larger than maxFileSizeList are skipped.
 func ScanFiles() []types.FileResult {
+	return ScanFilesFiltered(nil)
+}
+
+// ScanFilesFiltered is like ScanFiles but applies an optional include filter.
+func ScanFilesFiltered(filter *FileScanFilter) []types.FileResult {
 	home, _ := os.UserHomeDir()
 	if home == "" {
 		return nil
@@ -65,9 +121,12 @@ func ScanFiles() []types.FileResult {
 	var results []types.FileResult
 	seen := make(map[string]bool)
 
+	// Allow matching .env etc. when filter is active (default scan skips hidden names)
+	allowHidden := filter != nil && filter.active()
+
 	for _, loc := range getScanLocations() {
 		dir := filepath.Join(home, loc.subPath)
-		scanDir(dir, loc.label, 0, &results, seen)
+		scanDir(dir, loc.label, 0, &results, seen, filter, allowHidden)
 		if len(results) >= maxFiles {
 			break
 		}
@@ -76,7 +135,7 @@ func ScanFiles() []types.FileResult {
 	return results
 }
 
-func scanDir(dir, label string, depth int, results *[]types.FileResult, seen map[string]bool) {
+func scanDir(dir, label string, depth int, results *[]types.FileResult, seen map[string]bool, filter *FileScanFilter, allowHidden bool) {
 	if depth > maxScanDepth || len(*results) >= maxFiles {
 		return
 	}
@@ -92,20 +151,27 @@ func scanDir(dir, label string, depth int, results *[]types.FileResult, seen map
 		}
 
 		name := e.Name()
-		// skip hidden / system files
-		if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "$") {
+		// skip hidden / system files unless filter explicitly wants .env-style names
+		if strings.HasPrefix(name, "$") {
+			continue
+		}
+		if strings.HasPrefix(name, ".") && !allowHidden {
 			continue
 		}
 
 		fullPath := filepath.Join(dir, name)
 
 		if e.IsDir() {
-			scanDir(fullPath, label, depth+1, results, seen)
+			scanDir(fullPath, label, depth+1, results, seen, filter, allowHidden)
 			continue
 		}
 
 		ext := strings.ToLower(filepath.Ext(name))
-		if !targetExtensions[ext] {
+		// .env has empty Ext() in some cases — treat as ".env"
+		if name == ".env" || strings.HasPrefix(strings.ToLower(name), ".env.") {
+			ext = ".env"
+		}
+		if !fileMatchesFilter(name, ext, filter) {
 			continue
 		}
 

