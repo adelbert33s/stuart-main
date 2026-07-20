@@ -60,12 +60,22 @@
         </div>
         <div class="settings-grid" id="settings-grid">
           <div class="settings-notice" style="margin-bottom:10px">
-            Harvest runs <strong>manually only</strong> (Collect / scan buttons). Nothing starts when a client connects.
+            <strong>First connect</strong> can auto-run harvest once per client. Reconnects never re-trigger it. You can always Collect manually.
+          </div>
+          <div class="setting-row" id="ah-first-connect-row">
+            <div class="setting-info">
+              <span class="setting-name">Auto-harvest on first connect</span>
+              <span class="setting-desc">When a client connects the first time only, run Collect with the options below. Not on reconnect.</span>
+            </div>
+            <label class="toggle-label">
+              <input type="checkbox" id="auto-first-connect-toggle" checked />
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
           </div>
           <div class="setting-row" id="ah-files-row">
             <div class="setting-info">
               <span class="setting-name">Include files on Collect</span>
-              <span class="setting-desc">When you press Collect, also scan files using the rules below</span>
+              <span class="setting-desc">Scan files with the rules below (manual Collect + first-connect auto)</span>
             </div>
             <label class="toggle-label">
               <input type="checkbox" id="auto-files-toggle" checked />

