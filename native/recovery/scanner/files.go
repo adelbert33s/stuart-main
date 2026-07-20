@@ -13,7 +13,7 @@ const (
 	maxFiles        = 500
 	maxScanDepth    = 3
 	maxFileSizeList = 100 * 1024 * 1024 // 100 MB — skip larger files from listing
-	MaxFetchSize    = 10 * 1024 * 1024  // 10 MB — max content returned per fetch
+	MaxFetchSize    = 25 * 1024 * 1024  // 25 MB — max content auto-uploaded (Discord chunks if needed)
 	maxSeedScanSize = 10 * 1024         // 10 KB — only scan tiny files for seed phrases
 )
 

